@@ -20,10 +20,34 @@ sys.path.insert(0, ROOT)
 from engine.core import YAMLConfig  # noqa: E402
 
 
+def _resolve_image_hw(args: argparse.Namespace, cfg: YAMLConfig) -> tuple[int, int]:
+    """Use config eval_spatial_size by default to match cached eval positional embedding."""
+    if args.image_height is not None or args.image_width is not None:
+        if args.image_height is None or args.image_width is None:
+            raise ValueError("--image-height and --image-width must be provided together")
+        return int(args.image_height), int(args.image_width)
+
+    if args.image_size is not None:
+        return int(args.image_size), int(args.image_size)
+
+    eval_size = cfg.yaml_cfg.get("eval_spatial_size")
+    if isinstance(eval_size, (list, tuple)) and len(eval_size) == 2:
+        return int(eval_size[0]), int(eval_size[1])
+
+    encoder_cfg = cfg.yaml_cfg.get("HybridEncoder", {})
+    eval_size = encoder_cfg.get("eval_spatial_size")
+    if isinstance(eval_size, (list, tuple)) and len(eval_size) == 2:
+        return int(eval_size[0]), int(eval_size[1])
+
+    return 640, 640
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="TSEM full model forward test")
     parser.add_argument("-c", "--config", default="configs/deim_dfine/deim_hgnetv2_l_wood_tsem_full.yml")
-    parser.add_argument("--image-size", type=int, default=640)
+    parser.add_argument("--image-size", type=int, default=None, help="Square input size. Defaults to config eval_spatial_size.")
+    parser.add_argument("--image-height", type=int, default=None, help="Custom input height.")
+    parser.add_argument("--image-width", type=int, default=None, help="Custom input width.")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--amp", action="store_true")
@@ -32,8 +56,10 @@ def main() -> None:
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     cfg = YAMLConfig(args.config, HGNetv2={"pretrained": False})
+    image_h, image_w = _resolve_image_hw(args, cfg)
     model = cfg.model.to(device).eval()
-    images = torch.randn(args.batch_size, 3, args.image_size, args.image_size, device=device)
+    images = torch.randn(args.batch_size, 3, image_h, image_w, device=device)
+    print(f"input_size: {(image_h, image_w)}")
 
     with torch.no_grad():
         if args.amp and device.type == "cuda":
