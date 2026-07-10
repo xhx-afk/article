@@ -1,0 +1,66 @@
+# COCO 目标检测数据集配置。
+# 本文件提供标准 COCO train2017/val2017 的路径、类别数、评估器和 DataLoader 壳配置；
+# 训练增强细节通常由 configs/base/dataloader.yml 或模型配置继续覆盖。
+
+# 任务类型：目标检测。
+task: detection
+
+evaluator:
+  # 使用 COCO API 风格评估器计算 AP/AR 等指标。
+  type: CocoEvaluator
+  # 只评估 bbox；如果做实例分割才需要增加 segm。
+  iou_types: ['bbox', ]
+
+# COCO detection 标准类别数。
+num_classes: 80
+# True 表示把 COCO 原始 category_id 重映射为连续类别索引，适配模型分类头。
+remap_mscoco_category: True
+
+train_dataloader: 
+  # PyTorch DataLoader 的配置入口。
+  type: DataLoader
+  dataset: 
+    # COCO 格式检测数据集读取器。
+    type: CocoDetection
+    # 训练图片目录。
+    img_folder: /datassd/COCO/train2017/
+    # COCO instances 训练标注文件。
+    ann_file: /datassd/COCO/annotations/instances_train2017.json
+    # 目标检测不返回 mask；实例分割任务才需要 True。
+    return_masks: False
+    transforms:
+      # Compose 会串联执行 ops；ops 在基础 dataloader 或模型配置中覆盖。
+      type: Compose
+      # 这里留空，表示当前文件不直接定义增强。
+      ops: ~
+  # 训练集需要打乱样本顺序。
+  shuffle: True
+  # DataLoader 工作进程数。
+  num_workers: 4
+  # 丢弃最后不足一个 batch 的样本，便于多卡同步和 batch 维度稳定。
+  drop_last: True 
+  collate_fn:
+    # 自定义拼 batch 函数，支持检测标注和多尺度训练。
+    type: BatchImageCollateFunction
+
+
+val_dataloader:
+  type: DataLoader
+  dataset: 
+    type: CocoDetection
+    # 验证图片目录。
+    img_folder: /datassd/COCO/val2017/
+    # COCO instances 验证标注文件。
+    ann_file: /datassd/COCO/annotations/instances_val2017.json
+    return_masks: False
+    transforms:
+      type: Compose
+      # 验证预处理同样由基础 dataloader 覆盖，例如 Resize 和 ConvertPILImage。
+      ops: ~ 
+  # 验证集不打乱，保证评估顺序稳定。
+  shuffle: False
+  num_workers: 4
+  # 验证时保留所有样本，不能丢弃最后不足 batch 的图片。
+  drop_last: False
+  collate_fn:
+    type: BatchImageCollateFunction

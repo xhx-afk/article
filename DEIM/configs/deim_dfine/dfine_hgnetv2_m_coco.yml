@@ -1,0 +1,87 @@
+# D-FINE HGNetv2-Medium 在 COCO 上的训练配置。
+# Medium 使用 HGNetv2 B2 主干，通道数更高，通常比 Small 精度更好但训练/推理更重。
+__include__: [
+  # COCO 数据集与评估器。
+  '../dataset/coco_detection.yml',
+  # 运行时设置。
+  '../runtime.yml',
+  # DataLoader 与基础增强。
+  '../base/dataloader.yml',
+  # 优化器默认值。
+  '../base/optimizer.yml',
+  # 基础模型结构。
+  '../base/dfine_hgnetv2.yml',
+]
+
+# 当前实验输出目录。
+output_dir: ./output/dfine_hgnetv2_m_coco
+
+
+DEIM:
+  # 使用 HGNetv2 主干。
+  backbone: HGNetv2
+
+HGNetv2:
+  # B2 主干比 B0 更宽。
+  name: 'B2'
+  # 返回 3 个尺度特征。
+  return_idx: [1, 2, 3]
+  # 不冻结 backbone 阶段。
+  freeze_at: -1
+  # BN/Norm 参与训练。
+  freeze_norm: False
+  # 启用 LAB 相关设置。
+  use_lab: True
+
+DFINETransformer:
+  # Medium decoder 使用 4 层；旁注为可尝试的更深层数。
+  num_layers: 4  # 可尝试 5/6 层。
+  # 评估取最后一层输出；旁注为可选评估层。
+  eval_idx: -1  # 可尝试 -2/-3。
+
+HybridEncoder:
+  # 对应 HGNetv2 B2 的多尺度输出通道。
+  in_channels: [384, 768, 1536]
+  # encoder 仍使用 256 hidden_dim，控制 decoder 输入宽度。
+  hidden_dim: 256
+  # 跨尺度融合深度倍率高于 Small。
+  depth_mult: 0.67
+
+optimizer:
+  type: AdamW
+  params:
+    -
+      # backbone 非 norm/bn 参数使用较低学习率，适配更大的预训练主干。
+      params: '^(?=.*backbone)(?!.*norm|bn).*$'
+      lr: 0.00002
+    -
+      # backbone norm/bn 参数不做 weight decay。
+      params: '^(?=.*backbone)(?=.*norm|bn).*$'
+      lr: 0.00002
+      weight_decay: 0.
+    -
+      # encoder/decoder 的 norm、bn、bias 不做 weight decay。
+      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn|bias)).*$'
+      weight_decay: 0.
+
+  # 默认学习率。
+  lr: 0.0002
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+
+# 总训练轮数；120 轮后继续训练 12 轮用于后期收敛/EMA 搜索。
+epoches: 132 # 120 + 12
+train_dataloader:
+  dataset:
+    transforms:
+      policy:
+        # 第 120 个 epoch 后停止强增广。
+        epoch: 120
+  collate_fn:
+    # collate 阶段同步停止多尺度/混合增强。
+    stop_epoch: 120
+    # 停止强增广后 EMA 使用的重启衰减。
+    ema_restart_decay: 0.9999
+    # 同一输入尺寸重复 6 次后再切换。
+    base_size_repeat: 6

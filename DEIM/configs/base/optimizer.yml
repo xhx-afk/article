@@ -1,0 +1,56 @@
+# 通用训练优化配置。
+# 具体模型规格文件可能覆盖 epoch、batch size、optimizer 分组学习率等值。
+
+# 自动混合精度训练，通常可以降低显存占用并提高吞吐。
+use_amp: True
+# 使用模型参数指数滑动平均（EMA），评估/保存时通常使用更平滑的权重。
+use_ema: True
+ema:
+  type: ModelEMA
+  # EMA 衰减系数，越接近 1 表示历史权重占比越高、更新越平滑。
+  decay: 0.9999
+  # warmup 期间逐步启用 EMA，避免训练初期权重剧烈波动影响平均模型。
+  warmups: 1000
+  # 从第几个 epoch/阶段开始启用，具体解释由 ModelEMA 实现决定。
+  start: 0
+
+# 总训练轮数；项目中保留键名 epoches，训练代码可能按该名称读取。
+epoches: 72
+# 梯度裁剪阈值，防止梯度爆炸；0.1 是 DETR 类模型中常见的较保守设置。
+clip_max_norm: 0.1
+
+
+optimizer:
+  # AdamW 解耦 weight decay，适合 transformer/检测模型训练。
+  type: AdamW
+  params:
+    -
+      # backbone 中非 norm 参数使用较小学习率，避免预训练特征被过快破坏。
+      params: '^(?=.*backbone)(?!.*norm).*$'
+      lr: 0.0000125
+    -
+      # encoder/decoder 中的 norm/bn 参数不做 weight decay，避免归一化参数被过度正则化。
+      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+
+  # 默认学习率；未命中特殊 params 分组的参数使用该值。
+  lr: 0.00025
+  # AdamW 一阶/二阶动量系数。
+  betas: [0.9, 0.999]
+  # 默认权重衰减；特殊分组可覆盖为 0。
+  weight_decay: 0.000125
+
+
+lr_scheduler:
+  # 基础配置中的多阶段学习率衰减器；部分 DEIM 配置会改用 flatcosine 相关参数。
+  type: MultiStepLR
+  # 到达这些 epoch/step 节点时按 gamma 衰减，具体单位由训练代码实现决定。
+  milestones: [500]
+  # 学习率衰减倍率。
+  gamma: 0.1
+
+lr_warmup_scheduler:
+  # 线性 warmup：训练初期从较小学习率逐步升到 optimizer.lr。
+  type: LinearWarmup
+  # warmup 持续长度，具体单位由训练代码实现决定。
+  warmup_duration: 500

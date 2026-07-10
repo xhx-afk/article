@@ -1,0 +1,89 @@
+# D-FINE HGNetv2-Small 在 COCO 上的训练配置。
+# 该规格比 Nano 使用 3 个特征层和 256 hidden_dim，速度与精度折中。
+__include__: [
+  # COCO 数据集、类别和评估器。
+  '../dataset/coco_detection.yml',
+  # 运行时默认配置。
+  '../runtime.yml',
+  # DataLoader 与通用增强。
+  '../base/dataloader.yml',
+  # 优化器默认配置。
+  '../base/optimizer.yml',
+  # 基础模型结构。
+  '../base/dfine_hgnetv2.yml',
+]
+
+# 当前实验输出目录。
+output_dir: ./output/dfine_hgnetv2_s_coco
+
+
+DEIM:
+  # 使用 HGNetv2 主干。
+  backbone: HGNetv2
+
+HGNetv2:
+  # Small 规格仍使用 B0，但返回更多尺度特征。
+  name: 'B0'
+  # 返回 3 个尺度特征，对应 strides 8/16/32。
+  return_idx: [1, 2, 3]
+  # 不冻结 backbone 阶段。
+  freeze_at: -1
+  # BN/Norm 参与训练。
+  freeze_norm: False
+  # 启用 LAB 相关设置。
+  use_lab: True
+
+DFINETransformer:
+  # decoder 层数；旁注给出可尝试的更深设置。
+  num_layers: 3  # 可尝试 4/5/6 层。
+  # 评估使用最后一层；旁注为辅助层评估的可选设置。
+  eval_idx: -1  # 可尝试 -2/-3/-4。
+
+HybridEncoder:
+  # 与 HGNetv2 B0 的 return_idx [1,2,3] 对齐。
+  in_channels: [256, 512, 1024]
+  # Small 恢复到 256 hidden_dim，增强表达能力。
+  hidden_dim: 256
+  # 降低跨尺度融合深度，控制计算量。
+  depth_mult: 0.34
+  # 跨尺度融合通道扩张倍率。
+  expansion: 0.5
+
+optimizer:
+  type: AdamW
+  params:
+    -
+      # backbone 非 norm/bn 参数使用较小学习率，保护预训练特征。
+      params: '^(?=.*backbone)(?!.*norm|bn).*$'
+      lr: 0.0001
+    -
+      # backbone norm/bn 参数同样使用低学习率，但不做 weight decay。
+      params: '^(?=.*backbone)(?=.*norm|bn).*$'
+      lr: 0.0001
+      weight_decay: 0.
+    -
+      # encoder/decoder 中 norm、bn、bias 不做 weight decay。
+      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn|bias)).*$'
+      weight_decay: 0.
+
+  # 默认学习率。
+  lr: 0.0002
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+
+# 总训练轮数；120 轮后继续训练 12 轮用于后期收敛/EMA 搜索。
+epoches: 132 # 120 + 12
+train_dataloader:
+  dataset:
+    transforms:
+      policy:
+        # 第 120 个 epoch 后停止强增广。
+        epoch: 120
+  collate_fn:
+    # collate 阶段同步停止多尺度/混合增强。
+    stop_epoch: 120
+    # 停止强增广后 EMA 使用的重启衰减。
+    ema_restart_decay: 0.9999
+    # 同一输入尺寸重复 20 次后再切换，降低多尺度训练抖动。
+    base_size_repeat: 20

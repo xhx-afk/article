@@ -1,0 +1,65 @@
+# 自定义目标检测数据集配置。
+# 这里默认数据仍采用 COCO JSON 标注格式，只是图片目录、标注路径、类别数改为用户自己的数据。
+# 如果你的数据不是 COCO 格式，需要同时修改 dataset type 或实现对应 Dataset。
+
+# 任务类型：目标检测。
+task: detection
+
+evaluator:
+  # 即使是自定义数据，只要标注是 COCO 格式，也可以继续使用 CocoEvaluator。
+  type: CocoEvaluator
+  # 仅评估 bbox 指标。
+  iou_types: ['bbox', ]
+
+# 自定义数据集类别数，不包含背景类；训练前必须改成真实类别数量。
+num_classes: 777 # 改成你的自定义数据集真实类别数。
+# 自定义数据通常类别 id 已由自己的 JSON 控制，因此默认不使用 COCO 80 类重映射。
+# 如果你直接训练标准 COCO 或沿用 COCO category_id，才考虑改为 True。
+remap_mscoco_category: False
+
+train_dataloader:
+  type: DataLoader
+  dataset:
+    # 默认沿用 COCO 格式读取器，要求 ann_file 是 COCO instances 风格 JSON。
+    type: CocoDetection
+    # 训练图片目录，替换为自己的 train 图片路径。
+    img_folder: /data/yourdataset/train
+    # 训练集 COCO JSON 标注文件路径。
+    ann_file: /data/yourdataset/train/train.json
+    # 目标检测任务不返回 mask。
+    return_masks: False
+    transforms:
+      # 实际训练增强由 base/dataloader.yml 或模型配置覆盖。
+      type: Compose
+      ops: ~
+  # 训练阶段打乱样本。
+  shuffle: True
+  # 数据加载进程数，可根据 CPU、磁盘速度和内存调整。
+  num_workers: 4
+  # 训练时丢弃最后不足 batch 的样本，保持 batch 形状稳定。
+  drop_last: True
+  collate_fn:
+    # 检测任务自定义 batch 拼接函数。
+    type: BatchImageCollateFunction
+
+
+val_dataloader:
+  type: DataLoader
+  dataset:
+    type: CocoDetection
+    # 验证图片目录，替换为自己的 val 图片路径。
+    img_folder: /data/yourdataset/val
+    # 验证集 COCO JSON 标注文件路径。
+    ann_file: /data/yourdataset/val/val.json
+    return_masks: False
+    transforms:
+      # 验证预处理由 base/dataloader.yml 中 val_dataloader.transforms 覆盖。
+      type: Compose
+      ops: ~
+  # 验证阶段不打乱，便于复现实验和定位单张图片结果。
+  shuffle: False
+  num_workers: 4
+  # 验证必须保留所有样本。
+  drop_last: False
+  collate_fn:
+    type: BatchImageCollateFunction

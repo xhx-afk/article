@@ -1,0 +1,64 @@
+# D-FINE HGNetv2-Large 在 COCO 上的训练配置。
+# Large 使用 HGNetv2 B4 主干，参数量更大，因此采用更小的 backbone 学习率和更保守的冻结策略。
+__include__: [
+  # COCO 数据集与评估器。
+  '../dataset/coco_detection.yml',
+  # 运行时默认值。
+  '../runtime.yml',
+  # DataLoader 与基础增强。
+  '../base/dataloader.yml',
+  # 优化器默认值。
+  '../base/optimizer.yml',
+  # 基础模型结构。
+  '../base/dfine_hgnetv2.yml',
+]
+
+# 当前实验输出目录。注意这里使用 outputs，而部分较小规格使用 output。
+output_dir: ./outputs/dfine_hgnetv2_l_coco
+
+
+HGNetv2:
+  # B4 是 Large 规格主干。
+  name: 'B4'
+  # 返回 3 个尺度特征。
+  return_idx: [1, 2, 3]
+  # 仅冻结 stem，保留主体阶段可训练空间。
+  freeze_stem_only: True
+  # 冻结到第 0 阶段，配合 freeze_stem_only 控制冻结范围。
+  freeze_at: 0
+  # 冻结归一化层，适合大模型/较小 batch 下稳定训练。
+  freeze_norm: True
+
+optimizer:
+  type: AdamW
+  params:
+    -
+      # 大主干使用很小的 backbone 学习率，避免破坏预训练权重。
+      params: '^(?=.*backbone)(?!.*norm|bn).*$'
+      lr: 0.0000125
+    -
+      # encoder/decoder 的 norm/bn 参数不做 weight decay。
+      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+
+  # 默认学习率，主要作用于 encoder/decoder 等非特殊分组参数。
+  lr: 0.00025
+  betas: [0.9, 0.999]
+  weight_decay: 0.000125
+
+
+# 总训练轮数；72 轮后额外训练 8 轮用于后期收敛/EMA 搜索。
+epoches: 80 # 72 + 8
+train_dataloader:
+  dataset:
+    transforms:
+      policy:
+        # 第 72 个 epoch 后停止强增广。
+        epoch: 72
+  collate_fn:
+    # collate 阶段同步停止多尺度/混合增强。
+    stop_epoch: 72
+    # 强增广停止后的 EMA 重启衰减。
+    ema_restart_decay: 0.9999
+    # 同一输入尺寸重复 4 次后再切换。
+    base_size_repeat: 4

@@ -1,0 +1,66 @@
+
+# 通用 DataLoader 与数据增强配置。
+# 数据集类型、图片目录、标注文件和类别数由 configs/dataset/*.yml 提供；
+# 本文件主要补充训练/验证阶段的 transforms、batch 拼接方式和加载线程数。
+train_dataloader:
+  # 训练集的预处理与增强流水线。这里会合并到 dataset 配置中的 transforms 字段。
+  dataset:
+    transforms:
+      ops:
+        # 随机光度扰动：亮度、对比度、饱和度、色相等，提升模型对成像条件变化的鲁棒性。
+        - {type: RandomPhotometricDistort, p: 0.5}
+        # 随机向外缩放画布并填充背景，制造小目标/留白场景。
+        - {type: RandomZoomOut, fill: 0}
+        # 随机 IoU 裁剪，保留与目标框满足一定 IoU 条件的裁剪区域。
+        - {type: RandomIoUCrop, p: 0.8}
+        # 清理过小或非法的标注框，避免后续增强产生无效 bbox。
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        # 随机水平翻转，默认概率由 transform 实现决定。
+        - {type: RandomHorizontalFlip}
+        # 将训练图片缩放到模型默认输入尺寸 640x640。
+        - {type: Resize, size: [640, 640], }
+        # Resize 后再次清理 bbox，防止缩放/裁剪后出现无效框。
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        # PIL 图像转 float32 tensor，并按 scale=True 归一化到常用数值范围。
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        # bbox 转为 cxcywh 格式并归一化到 0~1，供 DETR/DEIM 类检测头训练使用。
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+      policy:
+        # stop_epoch 策略：训练到指定 epoch 后关闭下方 ops 中列出的强增广。
+        name: stop_epoch
+        epoch: 72 # 从第 72 个 epoch 起停止 ops 中列出的增强，进入更稳定的收敛阶段。
+        # 这些增强在训练后期会被关闭；其余 Resize/格式转换等基础处理仍然保留。
+        ops: ['Mosaic', 'RandomPhotometricDistort', 'RandomZoomOut', 'RandomIoUCrop']
+
+  collate_fn:
+    # 自定义 batch 拼接函数，负责把不同图片/标注组合成一个训练 batch。
+    type: BatchImageCollateFunction
+    # 多尺度训练的基准尺寸；实际尺寸可能围绕该值按实现逻辑变化。
+    base_size: 640
+    # 同一随机输入尺寸重复使用的次数，降低每个 batch 都变尺寸带来的抖动。
+    base_size_repeat: 3
+    stop_epoch: 72 # 从第 72 个 epoch 起停止多尺度变化，固定输入尺寸便于收敛。
+
+  # 训练阶段打乱样本顺序。
+  shuffle: True
+  # 全局 batch size；多卡训练时通常表示所有 GPU 上 batch size 的总和。
+  total_batch_size: 32 # 例如 4 卡 * 每卡 8 = 32。
+  # DataLoader 工作进程数；过大可能占用较多 CPU/内存，过小可能喂不满 GPU。
+  num_workers: 4
+
+
+val_dataloader:
+  # 验证集只做确定性预处理，不做随机增强，保证评估结果可复现。
+  dataset:
+    transforms:
+      ops:
+        # 验证输入尺寸与训练默认尺寸保持一致。
+        - {type: Resize, size: [640, 640], }
+        # 转为 float32 tensor；验证阶段通常不需要 bbox 格式转换，由评估流程处理标注。
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+  # 验证阶段不打乱，方便复现和排查单张图片结果。
+  shuffle: False
+  # 验证只前向计算，可使用更大的总 batch size，实际值仍受显存限制。
+  total_batch_size: 64
+  # 验证 DataLoader 工作进程数。
+  num_workers: 4

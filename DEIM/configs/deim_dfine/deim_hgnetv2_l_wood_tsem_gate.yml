@@ -1,0 +1,17 @@
+# DEIM-L Wood + TSEM dual_gate 消融配置。
+
+__include__:
+  - "./deim_hgnetv2_l_wood.yml"
+
+output_dir: ./deim_outputs/deim_hgnetv2_l_wood_tsem_gate_960
+
+HybridEncoder:
+  use_tsem: true
+  tsem_mode: dual_gate
+  tsem_levels: [0, 1, 2]
+  tsem_smooth_kernel: 5
+  tsem_dilations: [1, 2, 3]
+  tsem_reduction: 16
+  tsem_init_scale: 0.0
+  tsem_learnable_smoothing: true
+  tsem_debug: false

@@ -1,0 +1,34 @@
+# 通用运行时配置。
+# 这里放训练日志、输出目录、分布式训练、AMP 和 EMA 等与模型结构无关的开关。
+
+# 每隔多少个 iteration 打印一次训练日志。
+print_freq: 100
+# 默认输出目录；具体模型配置通常会覆盖 output_dir。
+output_dir: './logs'
+# checkpoint 保存间隔，单位通常为 epoch；模型配置可覆盖。
+checkpoint_freq: 12
+
+
+# 分布式训练时同步 BatchNorm 统计量，多卡训练更稳定；单卡时通常影响不大。
+sync_bn: True
+# DDP 是否查找未参与反向传播的参数；False 更快，但要求模型每次前向都使用全部需要训练的参数。
+find_unused_parameters: False
+
+
+# runtime 默认不启用 AMP；base/optimizer.yml 或模型配置可能覆盖为 True。
+use_amp: False
+scaler:
+  # AMP 梯度缩放器，避免 float16 训练中梯度下溢。
+  type: GradScaler
+  # scaler 是否启用；最终是否使用 AMP 还取决于 use_amp。
+  enabled: True
+
+
+# runtime 默认不启用 EMA；base/optimizer.yml 或模型配置可能覆盖为 True。
+use_ema: False
+ema:
+  type: ModelEMA
+  # EMA 衰减系数。
+  decay: 0.9999
+  # EMA warmup 步数。
+  warmups: 1000

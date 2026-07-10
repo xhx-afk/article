@@ -1,0 +1,115 @@
+# D-FINE HGNetv2-Nano 在 COCO 上的训练配置。
+# 该文件组合数据集、运行时、通用 dataloader/optimizer 和基础模型结构，
+# 然后针对 Nano 规格覆盖通道数、层数、学习率、训练周期和 batch size。
+__include__: [
+  # 标准 COCO 数据集路径、类别数和评估器。
+  '../dataset/coco_detection.yml',
+  # 日志、输出目录、DDP、AMP/EMA 等运行时默认值。
+  '../runtime.yml',
+  # 通用训练/验证增强与 DataLoader 参数。
+  '../base/dataloader.yml',
+  # 通用 AdamW、EMA、warmup 和梯度裁剪设置。
+  '../base/optimizer.yml',
+  # D-FINE/DEIM HGNetv2 基础模型结构。
+  '../base/dfine_hgnetv2.yml',
+]
+
+# 当前实验的输出目录。
+output_dir: ./output/dfine_hgnetv2_n_coco
+
+
+DEIM:
+  # Nano 规格仍使用 HGNetv2 作为 backbone。
+  backbone: HGNetv2
+
+HGNetv2:
+  # HGNetv2 B0 是最小主干之一，适合轻量模型。
+  name: 'B0'
+  # 只返回后两个尺度特征，因此 encoder/decoder 也只使用 2 个特征层。
+  return_idx: [2, 3]
+  # -1 表示不冻结 backbone 阶段。
+  freeze_at: -1
+  # False 表示 BN/Norm 可训练。
+  freeze_norm: False
+  # 启用 LAB 相关模块/设置，具体行为由 HGNetv2 实现决定。
+  use_lab: True
+
+
+HybridEncoder:
+  # 对应 return_idx [2,3] 的两个输出通道。
+  in_channels: [512, 1024]
+  # 两个特征层的下采样倍率。
+  feat_strides: [16, 32]
+
+  # intra：Nano 使用更小 hidden_dim 和 FFN，降低计算量。
+  hidden_dim: 128
+  # 仅对最后一个特征层做 transformer encoder。
+  use_encoder_idx: [1]
+  dim_feedforward: 512
+
+  # cross：降低宽度和深度倍率，进一步减小模型规模。
+  expansion: 0.34
+  depth_mult: 0.5
+
+
+DFINETransformer:
+  # decoder 输入通道与 encoder 输出 hidden_dim 对齐。
+  feat_channels: [128, 128]
+  feat_strides: [16, 32]
+  hidden_dim: 128
+  dim_feedforward: 512
+  # 仅使用 2 个特征层。
+  num_levels: 2
+
+  # Nano decoder 层数较少，提升速度。
+  num_layers: 3
+  # 使用最后一层输出评估。
+  eval_idx: -1
+
+  # 每个特征层 attention 采样点数。
+  num_points: [6, 6]
+
+optimizer:
+  type: AdamW
+  params:
+    -
+      # backbone 非 norm/bn 参数使用与主学习率相同的 0.0004。
+      params: '^(?=.*backbone)(?!.*norm|bn).*$'
+      lr: 0.0004
+    -
+      # backbone norm/bn 参数不做 weight decay。
+      params: '^(?=.*backbone)(?=.*norm|bn).*$'
+      lr: 0.0004
+      weight_decay: 0.
+    -
+      # encoder/decoder 的 norm、bn、bias 不做 weight decay。
+      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn|bias)).*$'
+      weight_decay: 0.
+
+  # 默认学习率；未命中特殊分组的 encoder/decoder 参数使用该值。
+  lr: 0.0008
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+
+# 总训练轮数；148 轮后继续训练 12 轮以寻找更优 EMA。
+epoches: 160 # 148 + 12
+train_dataloader:
+  # Nano 规格显存占用低，可使用更大的全局 batch size。
+  total_batch_size: 128
+  dataset:
+    transforms:
+      policy:
+        # 第 148 个 epoch 后停止 policy 管理的强增广。
+        epoch: 148
+  collate_fn:
+    # 第 148 个 epoch 后停止多尺度/强混合逻辑。
+    stop_epoch: 148
+    # 增广停止后重启/调整 EMA 的衰减系数，帮助后期稳定。
+    ema_restart_decay: 0.9999
+    # 关闭固定重复次数，让 collate_fn 使用其默认多尺度重复策略。
+    base_size_repeat: ~
+
+val_dataloader:
+  # 验证阶段不反传，Nano 可使用更大的全局 batch size。
+  total_batch_size: 256
