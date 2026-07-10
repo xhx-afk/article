@@ -229,7 +229,7 @@ class TextureScaleBlock(nn.Module):
             residual = gate * high + (1.0 - gate) * context
 
         self._cache_debug(high, context, gate)
-        return residual
+        return residual.to(dtype=x.dtype)
 
 
 class CrossScaleGate(nn.Module):
@@ -340,7 +340,7 @@ class TextureScaleEnhancementModule(nn.Module):
                 continue
 
             block = self.blocks[level_key]
-            residual = block(feat)
+            residual = block(feat).to(dtype=feat.dtype, device=feat.device)
             gamma = self.gamma[idx].reshape(1, 1, 1, 1).to(dtype=feat.dtype, device=feat.device)
             if scale_weights is None:
                 scale = 1.0
