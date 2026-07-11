@@ -118,9 +118,20 @@ def is_main_process():
     return get_rank() == 0
 
 
-def save_on_master(*args, **kwargs):
+def barrier():
+    if is_dist_available_and_initialized():
+        torch.distributed.barrier()
+
+
+def save_on_master(obj, f, *args, **kwargs):
     if is_main_process():
-        torch.save(*args, **kwargs)
+        if isinstance(f, (str, os.PathLike)):
+            tmp_f = os.fspath(f) + ".tmp"
+            torch.save(obj, tmp_f, *args, **kwargs)
+            os.replace(tmp_f, f)
+        else:
+            torch.save(obj, f, *args, **kwargs)
+    barrier()
 
 
 
