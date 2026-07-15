@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import sys
 import types
 import unittest
@@ -71,6 +72,14 @@ class SQMALForwardTest(unittest.TestCase):
         self.assertTrue(torch.equal(baseline["pred_boxes"], extended["pred_boxes"]))
         self.assertIn("pred_quality", extended)
         self.assertNotIn("pred_defect_logits", extended)
+
+        deployed = copy.deepcopy(q4).deploy()
+        with torch.no_grad():
+            deployed_output = deployed(images)
+        self.assertEqual(tuple(deployed_output["pred_logits"].shape), (2, 300, 3))
+        self.assertEqual(tuple(deployed_output["pred_boxes"].shape), (2, 300, 4))
+        self.assertEqual(tuple(deployed_output["pred_quality"].shape), (2, 300, 1))
+        self.assertNotIn("pred_defect_logits", deployed_output)
 
         q4.train()
         criterion = q4_cfg.criterion.to(device).train()
