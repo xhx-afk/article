@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from .._misc import convert_to_tv_tensor, _boxes_keys
 from .._misc import Image, Video, Mask, BoundingBoxes
-from .._misc import SanitizeBoundingBoxes
+from .._misc import SanitizeBoundingBoxes as TorchvisionSanitizeBoundingBoxes
 
 from ...core import register
 torchvision.disable_beta_transforms_warning()
@@ -30,9 +30,37 @@ Resize = register()(T.Resize)
 # ToImageTensor = register()(T.ToImageTensor)
 # ConvertDtype = register()(T.ConvertDtype)
 # PILToTensor = register()(T.PILToTensor)
-SanitizeBoundingBoxes = register(name='SanitizeBoundingBoxes')(SanitizeBoundingBoxes)
 RandomCrop = register()(T.RandomCrop)
 Normalize = register()(T.Normalize)
+
+
+def _get_instance_fields(inputs: Any):
+    """返回需要与 bbox 使用同一个 keep mask 的 COCO 实例字段。"""
+    target = None
+    if isinstance(inputs, dict):
+        target = inputs
+    elif isinstance(inputs, (tuple, list)) and len(inputs) > 1 and isinstance(inputs[1], dict):
+        target = inputs[1]
+    if target is None:
+        return None
+    fields = []
+    for key in ("labels", "area", "iscrowd", "mask_valid", "mixup"):
+        value = target.get(key)
+        if isinstance(value, torch.Tensor):
+            fields.append(value)
+    return tuple(fields) if fields else None
+
+
+@register(name="SanitizeBoundingBoxes")
+class SanitizeBoundingBoxes(TorchvisionSanitizeBoundingBoxes):
+    """同步清理 boxes、masks 以及所有逐实例元数据。"""
+
+    def __init__(self, min_size: float = 1.0, min_area: float = 1.0, labels_getter=None) -> None:
+        super().__init__(
+            min_size=min_size,
+            min_area=min_area,
+            labels_getter=_get_instance_fields if labels_getter is None else labels_getter,
+        )
 
 
 @register()
