@@ -1,0 +1,14 @@
+# Q0：带 semantic RLE 数据链的原始 DEIM baseline。
+__include__: ["../deim_hgnetv2_l_wood.yml"]
+
+output_dir: ./output/sqmal/q0_baseline
+
+# 使用本配置前，请把 baseline 中 train/val ann_file 指向转换后的 *_sqmal.json。
+train_dataloader:
+  dataset:
+    return_masks: true
+
+val_dataloader:
+  dataset:
+    return_masks: true
+

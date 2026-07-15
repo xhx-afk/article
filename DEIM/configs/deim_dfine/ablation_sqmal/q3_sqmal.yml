@@ -1,0 +1,16 @@
+# Q3：Q2 + IoU 与 semantic support 联合构造的 SQ-MAL 主分类目标。
+__include__: ["./q2_defect_aux.yml"]
+
+output_dir: ./output/sqmal/q3_sqmal
+
+DEIMCriterion:
+  use_sqmal: true
+  semantic_beta: 0.5
+  semantic_warmup_epochs: 5
+  semantic_min_mask_area: 2.0
+  # 默认仅 main decoder 使用 SQ-MAL；aux/pre/enc/DN 保留原 MAL。
+  sqmal_aux_loss: false
+  losses: ["sqmal", "boxes", "local", "quality", "defect"]
+  weight_dict:
+    loss_sqmal: 1.0
+

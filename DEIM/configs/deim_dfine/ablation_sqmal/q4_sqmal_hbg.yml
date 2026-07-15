@@ -1,0 +1,14 @@
+# Q4：Q3 + 远离全部 GT 的高分困难背景 query 抑制。
+__include__: ["./q3_sqmal.yml"]
+
+output_dir: ./output/sqmal/q4_sqmal_hbg
+
+DEIMCriterion:
+  use_hard_bg: true
+  hard_bg_topk: 20
+  hard_bg_iou_threshold: 0.1
+  hard_bg_start_epoch: 5
+  losses: ["sqmal", "boxes", "local", "quality", "defect", "hard_bg"]
+  weight_dict:
+    loss_hard_bg: 0.25
+
