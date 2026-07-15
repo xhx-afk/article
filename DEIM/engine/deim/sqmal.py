@@ -43,6 +43,20 @@ class QueryQualityHead(nn.Module):
         return self.layers(query)
 
 
+def apply_quality_rerank(
+    scores: torch.Tensor,
+    quality_logit: Optional[torch.Tensor],
+    quality_power: float,
+) -> torch.Tensor:
+    """Apply query quality before class flatten/top-k; power=0 is identity."""
+    if quality_logit is None or float(quality_power) == 0.0:
+        return scores
+    quality = torch.sigmoid(quality_logit)
+    if quality.shape[-1] != 1 or quality.shape[:2] != scores.shape[:2]:
+        raise ValueError(f"quality shape {quality.shape} is incompatible with scores {scores.shape}")
+    return scores * quality.to(dtype=scores.dtype).pow(float(quality_power))
+
+
 def semantic_beta_schedule(max_beta: float, warmup_epochs: int, current_epoch: int) -> float:
     if warmup_epochs <= 0:
         return float(max_beta)
@@ -213,4 +227,3 @@ def select_hard_background_queries(
             selected[batch_index, chosen] = True
             counts[batch_index] = float(k)
     return selected, counts
-

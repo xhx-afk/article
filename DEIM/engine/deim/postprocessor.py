@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import torchvision
 
 from ..core import register
+from .sqmal import apply_quality_rerank
 
 
 __all__ = ['PostProcessor']
@@ -34,13 +35,17 @@ class PostProcessor(nn.Module):
         num_classes=80,
         use_focal_loss=True,
         num_top_queries=300,
-        remap_mscoco_category=False
+        remap_mscoco_category=False,
+        quality_rerank=False,
+        quality_power=0.5,
     ) -> None:
         super().__init__()
         self.use_focal_loss = use_focal_loss
         self.num_top_queries = num_top_queries
         self.num_classes = int(num_classes)
         self.remap_mscoco_category = remap_mscoco_category
+        self.quality_rerank = bool(quality_rerank)
+        self.quality_power = float(quality_power)
         self.deploy_mode = False
 
     def extra_repr(self) -> str:
@@ -56,6 +61,8 @@ class PostProcessor(nn.Module):
 
         if self.use_focal_loss:
             scores = F.sigmoid(logits)
+            if self.quality_rerank:
+                scores = apply_quality_rerank(scores, outputs.get('pred_quality'), self.quality_power)
             scores, index = torch.topk(scores.flatten(1), self.num_top_queries, dim=-1)
             # TODO for older tensorrt
             # labels = index % self.num_classes
@@ -66,6 +73,10 @@ class PostProcessor(nn.Module):
         else:
             scores = F.softmax(logits)[:, :, :-1]
             scores, labels = scores.max(dim=-1)
+            if self.quality_rerank and 'pred_quality' in outputs and self.quality_power != 0:
+                scores = apply_quality_rerank(
+                    scores.unsqueeze(-1), outputs['pred_quality'], self.quality_power
+                ).squeeze(-1)
             if scores.shape[1] > self.num_top_queries:
                 scores, index = torch.topk(scores, self.num_top_queries, dim=-1)
                 labels = torch.gather(labels, dim=1, index=index)
