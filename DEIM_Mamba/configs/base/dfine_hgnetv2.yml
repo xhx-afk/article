@@ -1,0 +1,140 @@
+# D-FINE/DEIM HGNetv2 检测模型的基础结构配置。
+# 具体模型规模（N/S/M/L/X）会在 configs/deim_dfine/*.yml 中覆盖 backbone 名称、
+# 通道数、层数、学习率和训练周期等参数。
+
+# 当前任务类型，训练入口会据此选择检测任务相关的构建逻辑。
+task: detection
+
+# 模型、损失函数和后处理模块的注册名。
+model: DEIM
+criterion: DEIMCriterion
+postprocessor: PostProcessor
+
+# 使用 focal/varifocal 风格分类损失的开关，需与 Criterion 中的 loss 配置一致。
+use_focal_loss: True
+# 评估时固定输入空间尺寸，格式为 [height, width]。
+eval_spatial_size: [640, 640] # 格式为 [高, 宽]。
+# checkpoint 保存间隔，单位为 epoch。
+checkpoint_freq: 4    # 每 4 个 epoch 保存一次。
+
+# 主模型由 backbone、encoder、decoder 三个部分组成。
+DEIM:
+  # 图像特征提取网络。
+  backbone: HGNetv2
+  # 多尺度特征融合编码器。
+  encoder: HybridEncoder
+  # D-FINE Transformer 解码器/检测头。
+  decoder: DFINETransformer
+
+# 学习率调度默认值。这里保留项目已有键名 lrsheduler。
+# 这些值通常会被 base/deim.yml 或具体模型规格文件覆盖。
+lrsheduler: flatcosine
+lr_gamma: 1
+warmup_iter: 500
+flat_epoch: 4000000
+no_aug_epoch: 0
+
+HGNetv2:
+  # 是否加载 ImageNet 等预训练权重。
+  pretrained: True
+  # 本地预训练权重目录；若迁移到新机器，需要确认该路径存在或改成自己的权重目录。
+  local_model_dir: ../RT-DETR-main/D-FINE/weight/hgnetv2/
+
+HybridEncoder:
+  # 从 backbone 接收的多尺度特征通道数；需与 HGNetv2 的 return_idx 对应。
+  in_channels: [512, 1024, 2048]
+  # 各特征层相对输入图像的下采样倍率。
+  feat_strides: [8, 16, 32]
+
+  # intra：单层/同尺度内部的 transformer 编码参数。
+  # encoder 内部统一使用的隐藏维度。
+  hidden_dim: 256
+  # 参与 transformer encoder 的特征层索引；[2] 表示只对最后一层高语义特征做编码。
+  use_encoder_idx: [2]
+  # transformer encoder 层数。
+  num_encoder_layers: 1
+  # 多头注意力的 head 数。
+  nhead: 8
+  # FFN 中间层维度。
+  dim_feedforward: 1024
+  # dropout 概率，0 表示不使用 dropout。
+  dropout: 0.
+  # encoder 内部激活函数。
+  enc_act: 'gelu'
+
+  # cross：跨尺度特征融合模块的宽度/深度与激活函数。
+  # 通道扩张倍率，影响融合层的中间通道数。
+  expansion: 1.0
+  # 深度倍率，影响融合结构重复次数。
+  depth_mult: 1
+  # 卷积/融合模块激活函数。
+  act: 'silu'
+
+
+DFINETransformer:
+  # decoder 输入的各尺度特征通道数，需与 HybridEncoder 输出一致。
+  feat_channels: [256, 256, 256]
+  # decoder 使用的特征步长。
+  feat_strides: [8, 16, 32]
+  # decoder hidden dimension。
+  hidden_dim: 256
+  # 使用的特征层数量。
+  num_levels: 3
+
+  # decoder 层数。
+  num_layers: 6
+  # 评估时取哪一层 decoder 输出，-1 表示最后一层。
+  eval_idx: -1
+  # object query 数量，也是每张图最多参与预测的 query 数。
+  num_queries: 300
+
+  # 去噪训练 query 数量；用于加速 DETR 类模型收敛。
+  num_denoising: 100
+  # 去噪标签扰动比例。
+  label_noise_ratio: 0.5
+  # 去噪框扰动尺度。
+  box_noise_scale: 1.0
+
+  # 分布式框回归相关参数。
+  # reg_max 为离散分布桶数，越大定位分辨率越细但计算更重。
+  reg_max: 32
+  # 框回归分布缩放系数，影响距离分布到 bbox 的映射范围。
+  reg_scale: 4
+
+  # 辅助 decoder 层的维度缩放。
+  # 例如 num_layers=6 且 eval_idx=-4 时，第 3、4、5 层会作为辅助 decoder 层。
+  layer_scale: 1  # 可尝试 2，用于放大辅助层维度。
+
+
+  # 每个特征层采样点数，影响 deformable/cross attention 的计算量与感受野。
+  num_points: [3, 6, 3] # 可尝试 [4, 4, 4] 等采样点组合。
+  # cross attention 实现方式：default 或 discrete。
+  cross_attn_method: default # 可选：default 或 discrete。
+  # query 选择方式：default 或 agnostic。
+  query_select_method: default # 可选：default 或 agnostic。
+
+
+PostProcessor:
+  # 后处理阶段保留的最高分 query 数；通常与 num_queries 保持一致。
+  num_top_queries: 300
+
+
+DEIMCriterion:
+  # 各损失项权重：vfl 分类、bbox L1、giou、fgl/ddf 局部分布定位损失。
+  weight_dict: {loss_vfl: 1, loss_bbox: 5, loss_giou: 2, loss_fgl: 0.15, loss_ddf: 1.5}
+  # 启用的损失集合。
+  losses: ['vfl', 'boxes', 'local']
+  # varifocal/focal 类分类损失的 alpha 和 gamma。
+  alpha: 0.75
+  gamma: 2.0
+  # Criterion 中的 reg_max 需与 decoder 的 reg_max 保持一致。
+  reg_max: 32
+
+  # Hungarian 匹配器负责把预测 query 与 GT 一对一匹配，用于计算训练监督。
+  matcher:
+    type: HungarianMatcher
+    # 匹配代价权重，通常与对应训练损失权重保持同一量级。
+    weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 2}
+    # 匹配阶段分类代价使用的 focal 参数。
+    alpha: 0.25
+    gamma: 2.0

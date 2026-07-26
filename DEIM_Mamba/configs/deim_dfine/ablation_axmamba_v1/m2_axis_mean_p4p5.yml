@@ -1,0 +1,106 @@
+# AxMamba V1 消融实验 M2：双向轴向 Mamba + local 固定均值融合。
+#
+# 实验目的：在 M1 的局部分支基础上加入水平、垂直两个长程建模分支，
+# 并使用固定的 1/3 均值融合，从而测量“轴向 Mamba 本身”的贡献，避免
+# 学习式门控网络成为额外变量。
+#
+# 本配置需要安装与服务器 PyTorch/CUDA 兼容的官方 mamba_ssm。
+# 除 AxMamba 参数和输出目录外，其余设置全部继承木材基线。
+__include__:
+  # 继承当前可训练的 DEIM-D-FINE-L 木材基线配置。
+  - ../deim_hgnetv2_l_wood.yml
+
+# M2 独立输出目录，用于保存固定均值融合实验的日志和检查点。
+output_dir: ./deim_outputs/deim_hgnetv2_l_wood_axmamba_m2_axis_mean
+
+HybridEncoder:
+  # 启用 AxMamba。
+  use_axmamba: true
+
+  # 仅增强 P4/P5：索引 1 对应 stride=16 的 P4，索引 2 对应
+  # stride=32 的 P5；索引 0 的 P3 不经过 AxMamba。
+  axmamba_levels: [1, 2]
+
+  # axis_mean 包含三个并行特征分支：
+  #   1. 水平双向 Mamba：逐行形成序列，正向和反向扫描共享参数；
+  #   2. 垂直双向 Mamba：逐列形成序列，正向和反向扫描共享参数；
+  #   3. local：并行 3x3/5x5 深度卷积。
+  # 最终 fused = (horizontal + vertical + local) / 3。
+  axmamba_mode: axis_mean
+
+  # Mamba 状态空间的隐状态维度 d_state。16 为 V1 规范默认值，
+  # 在建模能力、参数量和显存开销之间保持相对稳健的平衡。
+  axmamba_d_state: 16
+
+  # Mamba 内部局部因果卷积核大小，对应官方 Mamba 构造参数 d_conv。
+  axmamba_d_conv: 4
+
+  # Mamba 内部通道扩张倍率，对应官方 Mamba 构造参数 expand。
+  axmamba_expand: 2
+
+  # LayerScale 初始值。新分支以较小残差幅度接入原编码器，降低
+  # 加载 baseline 权重后训练初期对原特征分布的扰动。
+  axmamba_gamma_init: 0.001
+
+  # 首轮消融关闭 DropPath，使 M1/M2/M3 的残差随机性保持一致且为零。
+  axmamba_drop_path: 0.0
+
+# =============================================================================
+# M2 服务器执行命令（复制时去掉每行开头的 “# ”）
+# =============================================================================
+# 以下训练参数直接继承 ../deim_hgnetv2_l_wood.yml：
+#   quick_balanced_4000 训练集/验证集、960×960、25 epochs、worker=4；
+#   train/val 全局 batch 均为 8，单卡每卡 8，双卡每卡 4。
+# YAML 输出目录：
+#   /home/zxw4090/hjw/D-FINE/deim_outputs/deim_hgnetv2_l_wood_axmamba_m2_axis_mean
+#
+# 阶段 1：单卡正式训练（从 COCO 预训练权重微调）
+# cd /home/zxw4090/hjw/D-FINE
+# CUDA_VISIBLE_DEVICES=0 python /home/zxw4090/hjw/D-FINE/train.py \
+#   -c /home/zxw4090/hjw/D-FINE/configs/deim_dfine/ablation_axmamba_v1/m2_axis_mean_p4p5.yml \
+#   -t /home/zxw4090/hjw/D-FINE/weight/deim_dfine_hgnetv2_l_coco_50e.pth \
+#   --use-amp \
+#   --seed=0
+#
+# 阶段 2：双卡正式训练（GPU 0、1；全局 batch=8，每卡 batch=4）
+# cd /home/zxw4090/hjw/D-FINE
+# CUDA_VISIBLE_DEVICES=0,1 torchrun \
+#   --master_port=7792 \
+#   --nproc_per_node=2 \
+#   /home/zxw4090/hjw/D-FINE/train.py \
+#   -c /home/zxw4090/hjw/D-FINE/configs/deim_dfine/ablation_axmamba_v1/m2_axis_mean_p4p5.yml \
+#   -t /home/zxw4090/hjw/D-FINE/weight/deim_dfine_hgnetv2_l_coco_50e.pth \
+#   --use-amp \
+#   --seed=0
+#
+# 阶段 3：双卡断点续训（-r 与 -t 不能同时使用）
+# cd /home/zxw4090/hjw/D-FINE
+# CUDA_VISIBLE_DEVICES=0,1 torchrun \
+#   --master_port=7792 \
+#   --nproc_per_node=2 \
+#   /home/zxw4090/hjw/D-FINE/train.py \
+#   -c /home/zxw4090/hjw/D-FINE/configs/deim_dfine/ablation_axmamba_v1/m2_axis_mean_p4p5.yml \
+#   -r /home/zxw4090/hjw/D-FINE/deim_outputs/deim_hgnetv2_l_wood_axmamba_m2_axis_mean/last.pth \
+#   --use-amp \
+#   --seed=0
+#
+# 阶段 4：在 YAML 已配置的验证集上评估
+# cd /home/zxw4090/hjw/D-FINE
+# CUDA_VISIBLE_DEVICES=0 python /home/zxw4090/hjw/D-FINE/train.py \
+#   -c /home/zxw4090/hjw/D-FINE/configs/deim_dfine/ablation_axmamba_v1/m2_axis_mean_p4p5.yml \
+#   -r /home/zxw4090/hjw/D-FINE/deim_outputs/deim_hgnetv2_l_wood_axmamba_m2_axis_mean/best_stg2.pth \
+#   --test-only \
+#   --seed=0
+#
+# 阶段 5：在独立测试集上评估
+# test-only 固定使用 val_dataloader，因此这里只覆盖 test 图片和标注路径。
+# cd /home/zxw4090/hjw/D-FINE
+# CUDA_VISIBLE_DEVICES=0 python /home/zxw4090/hjw/D-FINE/train.py \
+#   -c /home/zxw4090/hjw/D-FINE/configs/deim_dfine/ablation_axmamba_v1/m2_axis_mean_p4p5.yml \
+#   -r /home/zxw4090/hjw/D-FINE/deim_outputs/deim_hgnetv2_l_wood_axmamba_m2_axis_mean/best_stg2.pth \
+#   --test-only \
+#   --seed=0 \
+#   --output-dir /home/zxw4090/hjw/D-FINE/deim_outputs/deim_hgnetv2_l_wood_axmamba_m2_axis_mean_test \
+#   -u \
+#     val_dataloader.dataset.img_folder=/home/zxw4090/hjw/D-FINE/data/WoodDefect/wood_coco_all_only_defect_quick_balanced_4000/images/test \
+#     val_dataloader.dataset.ann_file=/home/zxw4090/hjw/D-FINE/data/WoodDefect/wood_coco_all_only_defect_quick_balanced_4000/annotations/instances_test.json

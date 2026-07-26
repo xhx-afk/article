@@ -1,0 +1,82 @@
+# AxMamba V1 消融实验 M0：原始基线。
+#
+# 实验目的：
+#   1. 完全关闭 AxMamba，保持原 DEIM-D-FINE-L 木材缺陷检测模型；
+#   2. 作为 M1/M2/M3 的统一对照组；
+#   3. 用于检查新增代码在关闭状态下是否与原基线严格一致。
+#
+# 本文件只覆盖输出目录和 AxMamba 开关。数据集路径、输入尺寸、训练轮数、
+# 数据增强、优化器、HGNetv2、Transformer 编码器、D-FINE 解码器、损失函数
+# 等参数全部继承自现有木材基线，避免消融实验出现无关配置漂移。
+__include__:
+  # 当前项目中已经用于训练的 DEIM-D-FINE-L 木材数据集基线配置。
+  - ../deim_hgnetv2_l_wood.yml
+
+# M0 使用独立输出目录，防止覆盖原基线或其他 AxMamba 消融实验的权重和日志。
+output_dir: ./deim_outputs/deim_hgnetv2_l_wood_axmamba_m0
+
+HybridEncoder:
+  # 关闭 AxMamba。
+  # 关闭时 HybridEncoder 不创建 axmamba_blocks，也不会新增 AxMamba 参数；
+  # input_proj 之后直接进入原 Transformer encoder、FPN 和 PAN 路径。
+  use_axmamba: false
+
+# =============================================================================
+# M0 服务器执行命令（复制时去掉每行开头的 “# ”）
+# =============================================================================
+# 以下训练参数直接继承 ../deim_hgnetv2_l_wood.yml：
+#   quick_balanced_4000 训练集/验证集、960×960、25 epochs、worker=4；
+#   train/val 全局 batch 均为 8，单卡每卡 8，双卡每卡 4。
+# YAML 输出目录：
+#   /home/zxw4090/hjw/D-FINE/deim_outputs/deim_hgnetv2_l_wood_axmamba_m0
+#
+# 阶段 1：单卡正式训练（从 COCO 预训练权重微调）
+# cd /home/zxw4090/hjw/D-FINE
+# CUDA_VISIBLE_DEVICES=0 python /home/zxw4090/hjw/D-FINE/train.py \
+#   -c /home/zxw4090/hjw/D-FINE/configs/deim_dfine/ablation_axmamba_v1/m0_baseline.yml \
+#   -t /home/zxw4090/hjw/D-FINE/weight/deim_dfine_hgnetv2_l_coco_50e.pth \
+#   --use-amp \
+#   --seed=0
+#
+# 阶段 2：双卡正式训练（GPU 0、1；全局 batch=8，每卡 batch=4）
+# cd /home/zxw4090/hjw/D-FINE
+# CUDA_VISIBLE_DEVICES=0,1 torchrun \
+#   --master_port=7790 \
+#   --nproc_per_node=2 \
+#   /home/zxw4090/hjw/D-FINE/train.py \
+#   -c /home/zxw4090/hjw/D-FINE/configs/deim_dfine/ablation_axmamba_v1/m0_baseline.yml \
+#   -t /home/zxw4090/hjw/D-FINE/weight/deim_dfine_hgnetv2_l_coco_50e.pth \
+#   --use-amp \
+#   --seed=0
+#
+# 阶段 3：双卡断点续训（-r 与 -t 不能同时使用）
+# cd /home/zxw4090/hjw/D-FINE
+# CUDA_VISIBLE_DEVICES=0,1 torchrun \
+#   --master_port=7790 \
+#   --nproc_per_node=2 \
+#   /home/zxw4090/hjw/D-FINE/train.py \
+#   -c /home/zxw4090/hjw/D-FINE/configs/deim_dfine/ablation_axmamba_v1/m0_baseline.yml \
+#   -r /home/zxw4090/hjw/D-FINE/deim_outputs/deim_hgnetv2_l_wood_axmamba_m0/last.pth \
+#   --use-amp \
+#   --seed=0
+#
+# 阶段 4：在 YAML 已配置的验证集上评估
+# cd /home/zxw4090/hjw/D-FINE
+# CUDA_VISIBLE_DEVICES=0 python /home/zxw4090/hjw/D-FINE/train.py \
+#   -c /home/zxw4090/hjw/D-FINE/configs/deim_dfine/ablation_axmamba_v1/m0_baseline.yml \
+#   -r /home/zxw4090/hjw/D-FINE/deim_outputs/deim_hgnetv2_l_wood_axmamba_m0/best_stg2.pth \
+#   --test-only \
+#   --seed=0
+#
+# 阶段 5：在独立测试集上评估
+# test-only 固定使用 val_dataloader，因此这里只覆盖 test 图片和标注路径。
+# cd /home/zxw4090/hjw/D-FINE
+# CUDA_VISIBLE_DEVICES=0 python /home/zxw4090/hjw/D-FINE/train.py \
+#   -c /home/zxw4090/hjw/D-FINE/configs/deim_dfine/ablation_axmamba_v1/m0_baseline.yml \
+#   -r /home/zxw4090/hjw/D-FINE/deim_outputs/deim_hgnetv2_l_wood_axmamba_m0/best_stg2.pth \
+#   --test-only \
+#   --seed=0 \
+#   --output-dir /home/zxw4090/hjw/D-FINE/deim_outputs/deim_hgnetv2_l_wood_axmamba_m0_test \
+#   -u \
+#     val_dataloader.dataset.img_folder=/home/zxw4090/hjw/D-FINE/data/WoodDefect/wood_coco_all_only_defect_quick_balanced_4000/images/test \
+#     val_dataloader.dataset.ann_file=/home/zxw4090/hjw/D-FINE/data/WoodDefect/wood_coco_all_only_defect_quick_balanced_4000/annotations/instances_test.json

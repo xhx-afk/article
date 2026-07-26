@@ -1,0 +1,60 @@
+# DEIM HGNetv2-Nano 在 COCO 上的训练配置。
+# 先继承同规格 D-FINE 配置，再叠加 base/deim.yml 中的 DEIM 增强、损失和调度策略。
+__include__: [
+  # Nano 规格的 backbone/encoder/decoder、COCO 数据和 D-FINE 默认训练设置。
+  './dfine_hgnetv2_n_coco.yml',
+  # DEIM 专用的 Dense O2O 增强、MixUp、flatcosine 调度和 DEIMCriterion 覆盖。
+  '../base/deim.yml'
+]
+
+# DEIM Nano 实验输出目录。
+output_dir: ./deim_outputs/deim_hgnetv2_n_coco
+
+optimizer:
+  type: AdamW
+  params:
+    -
+      # backbone 非 norm/bn 参数学习率；Nano 中主干可使用相对较高学习率。
+      params: '^(?=.*backbone)(?!.*norm|bn).*$'
+      lr: 0.0004
+    -
+      # backbone norm/bn 参数不做 weight decay。
+      params: '^(?=.*backbone)(?=.*norm|bn).*$'
+      lr: 0.0004
+      weight_decay: 0.
+    -
+      # encoder/decoder 的 norm、bn、bias 不做 weight decay。
+      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn|bias)).*$'
+      weight_decay: 0.
+
+  # 默认学习率，主要作用于 encoder/decoder 的主体参数。
+  lr: 0.0008
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+# DEIM Nano 的总训练轮数；148 轮后再训练 12 轮用于无强增广收敛和 EMA 搜索。
+epoches: 160 # 148 + 12
+
+# DEIM flatcosine 学习率调度覆盖。
+# 该值由训练代码按 flatcosine 逻辑解释；Nano 配置给出较长的平坦阶段。
+flat_epoch: 7800    # 原项目经验值，保持不改。
+# 最后 12 个 epoch 关闭强增广。
+no_aug_epoch: 12
+# gamma=1.0 表示该配置不额外做倍率衰减。
+lr_gamma: 1.0
+
+# DEIM 数据增强阶段覆盖。
+train_dataloader: 
+  dataset: 
+    transforms:
+      policy:
+        # 三个阶段节点：预热/中期调度/停止强增广。
+        epoch: [4, 78, 148]   # 阶段节点列表。
+
+  collate_fn:
+    # MixUp 在前两个阶段内启用，后期关闭。
+    mixup_epochs: [4, 78]
+    # 第 148 个 epoch 后停止多尺度/强混合增强。
+    stop_epoch: 148
+    # 交给 collate_fn 默认策略决定 base_size_repeat。
+    base_size_repeat: ~

@@ -1,0 +1,98 @@
+# AxMamba V1 消融实验 M1：仅局部多核卷积分支。
+#
+# 实验目的：单独评估局部纹理与边缘增强带来的收益，排除 Mamba 轴向扫描
+# 和方向门控的影响。该配置不会创建任何 Mamba 实例，因此没有安装
+# mamba_ssm 时也可以构建、训练和推理。
+#
+# 除下方 AxMamba 参数和独立输出目录外，其余数据、增强、分辨率、优化器、
+# backbone、decoder、matcher 和 loss 均继承木材基线，保证消融公平。
+__include__:
+  # 继承当前可训练的 DEIM-D-FINE-L 木材基线配置。
+  - ../deim_hgnetv2_l_wood.yml
+
+# M1 独立保存日志、检查点和评估结果，不覆盖 M0/M2/M3。
+output_dir: ./deim_outputs/deim_hgnetv2_l_wood_axmamba_m1_local
+
+HybridEncoder:
+  # 启用 AxMamba 框架；具体只激活 local 分支。
+  use_axmamba: true
+
+  # HybridEncoder 接收三个尺度，索引与特征层对应关系为：
+  #   0 -> P3，stride=8，保持原样；
+  #   1 -> P4，stride=16，加入局部增强；
+  #   2 -> P5，stride=32，加入局部增强。
+  # 因此 [1, 2] 表示只处理 P4/P5，不改变高分辨率 P3。
+  axmamba_levels: [1, 2]
+
+  # local 模式仅使用并行 DWConv 3x3 和 DWConv 5x5 分支：
+  # 两个深度卷积结果求和后，经过 BN、SiLU、1x1 Conv 和输出 BN。
+  # 不创建水平/垂直 Mamba，也不创建三分支方向门控网络。
+  axmamba_mode: local
+
+  # LayerScale 残差系数 gamma 的初始值。
+  # 0.001 使模块从接近恒等映射开始训练，同时保留非零梯度通路；
+  # 不建议初始化为严格的 0。
+  axmamba_gamma_init: 0.001
+
+  # 随机深度概率。首轮干净消融设为 0，表示不随机丢弃 AxMamba 残差分支。
+  axmamba_drop_path: 0.0
+
+# =============================================================================
+# M1 服务器执行命令（复制时去掉每行开头的 “# ”）
+# =============================================================================
+# 以下训练参数直接继承 ../deim_hgnetv2_l_wood.yml：
+#   quick_balanced_4000 训练集/验证集、960×960、25 epochs、worker=4；
+#   train/val 全局 batch 均为 8，单卡每卡 8，双卡每卡 4。
+# YAML 输出目录：
+#   /home/zxw4090/hjw/D-FINE/deim_outputs/deim_hgnetv2_l_wood_axmamba_m1_local
+#
+# 阶段 1：单卡正式训练（从 COCO 预训练权重微调）
+# cd /home/zxw4090/hjw/D-FINE
+# CUDA_VISIBLE_DEVICES=0 python /home/zxw4090/hjw/D-FINE/train.py \
+#   -c /home/zxw4090/hjw/D-FINE/configs/deim_dfine/ablation_axmamba_v1/m1_local_p4p5.yml \
+#   -t /home/zxw4090/hjw/D-FINE/weight/deim_dfine_hgnetv2_l_coco_50e.pth \
+#   --use-amp \
+#   --seed=0
+#
+# 阶段 2：双卡正式训练（GPU 0、1；全局 batch=8，每卡 batch=4）
+# cd /home/zxw4090/hjw/D-FINE
+# CUDA_VISIBLE_DEVICES=0,1 torchrun \
+#   --master_port=7791 \
+#   --nproc_per_node=2 \
+#   /home/zxw4090/hjw/D-FINE/train.py \
+#   -c /home/zxw4090/hjw/D-FINE/configs/deim_dfine/ablation_axmamba_v1/m1_local_p4p5.yml \
+#   -t /home/zxw4090/hjw/D-FINE/weight/deim_dfine_hgnetv2_l_coco_50e.pth \
+#   --use-amp \
+#   --seed=0
+#
+# 阶段 3：双卡断点续训（-r 与 -t 不能同时使用）
+# cd /home/zxw4090/hjw/D-FINE
+# CUDA_VISIBLE_DEVICES=0,1 torchrun \
+#   --master_port=7791 \
+#   --nproc_per_node=2 \
+#   /home/zxw4090/hjw/D-FINE/train.py \
+#   -c /home/zxw4090/hjw/D-FINE/configs/deim_dfine/ablation_axmamba_v1/m1_local_p4p5.yml \
+#   -r /home/zxw4090/hjw/D-FINE/deim_outputs/deim_hgnetv2_l_wood_axmamba_m1_local/last.pth \
+#   --use-amp \
+#   --seed=0
+#
+# 阶段 4：在 YAML 已配置的验证集上评估
+# cd /home/zxw4090/hjw/D-FINE
+# CUDA_VISIBLE_DEVICES=0 python /home/zxw4090/hjw/D-FINE/train.py \
+#   -c /home/zxw4090/hjw/D-FINE/configs/deim_dfine/ablation_axmamba_v1/m1_local_p4p5.yml \
+#   -r /home/zxw4090/hjw/D-FINE/deim_outputs/deim_hgnetv2_l_wood_axmamba_m1_local/best_stg2.pth \
+#   --test-only \
+#   --seed=0
+#
+# 阶段 5：在独立测试集上评估
+# test-only 固定使用 val_dataloader，因此这里只覆盖 test 图片和标注路径。
+# cd /home/zxw4090/hjw/D-FINE
+# CUDA_VISIBLE_DEVICES=0 python /home/zxw4090/hjw/D-FINE/train.py \
+#   -c /home/zxw4090/hjw/D-FINE/configs/deim_dfine/ablation_axmamba_v1/m1_local_p4p5.yml \
+#   -r /home/zxw4090/hjw/D-FINE/deim_outputs/deim_hgnetv2_l_wood_axmamba_m1_local/best_stg2.pth \
+#   --test-only \
+#   --seed=0 \
+#   --output-dir /home/zxw4090/hjw/D-FINE/deim_outputs/deim_hgnetv2_l_wood_axmamba_m1_local_test \
+#   -u \
+#     val_dataloader.dataset.img_folder=/home/zxw4090/hjw/D-FINE/data/WoodDefect/wood_coco_all_only_defect_quick_balanced_4000/images/test \
+#     val_dataloader.dataset.ann_file=/home/zxw4090/hjw/D-FINE/data/WoodDefect/wood_coco_all_only_defect_quick_balanced_4000/annotations/instances_test.json

@@ -1,0 +1,71 @@
+# DEIM 的基础覆盖配置。
+# 该文件通常与 dfine_hgnetv2_*_coco.yml 一起 include，用于在 D-FINE 基础模型上启用
+# DEIM 的 Dense O2O 数据增强、学习率策略、BN 解冻、激活函数和损失函数设置。
+
+# Dense O2O 训练增强：在基础 dataloader 的增强链前加入 Mosaic，并用阶段策略控制强增广。
+train_dataloader: 
+  dataset: 
+    transforms:
+      ops:
+        # Mosaic 将多张图拼成一张训练样本；output_size=320 后续还会 Resize 到模型输入尺寸。
+        # rotation/translation/scaling 控制几何扰动范围；cache 相关参数控制是否缓存历史图片。
+        - {type: Mosaic, output_size: 320, rotation_range: 10, translation_range: [0.1, 0.1], scaling_range: [0.5, 1.5],
+           probability: 1.0, fill_value: 0, use_cache: False, max_cached_images: 50, random_pop: True}
+        # 以下增强与 base/dataloader.yml 中含义一致；在这里重新声明是为了和 Mosaic 组成 DEIM 的训练链。
+        - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: RandomZoomOut, fill: 0}
+        - {type: RandomIoUCrop, p: 0.8}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: RandomHorizontalFlip}
+        - {type: Resize, size: [640, 640], }
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+      policy:
+        # 阶段节点：前期逐步启用/调度强增广，中后期降低强增广，最后关闭强增广稳定收敛。
+        epoch: [4, 29, 50]   # 具体含义由 transform policy 实现解释，模型规格文件可覆盖这些节点。
+        # 受 policy 调度的强增广名称；基础格式转换和 bbox 清理不会被关闭。
+        ops: ['Mosaic', 'RandomPhotometricDistort', 'RandomZoomOut', 'RandomIoUCrop']
+      # Mosaic 被实际采用的概率；即使 Mosaic transform probability=1.0，这里仍可整体控制采样比例。
+      mosaic_prob: 0.5
+
+  collate_fn:
+    # MixUp 在 batch 拼接阶段做样本混合，常与 Mosaic 配合提升泛化。
+    mixup_prob: 0.5
+    # MixUp 的阶段节点；通常在训练后期关闭，让模型在真实样本分布上收敛。
+    mixup_epochs: [4, 29]
+    stop_epoch: 50    # 从该 epoch 起关闭多尺度/强混合相关逻辑，具体行为由 collate_fn 实现决定。
+
+# 解冻 HGNetv2 的 BN/归一化层设置。
+HGNetv2:
+  # freeze_at=-1 表示不冻结主干阶段；相比部分 D-FINE 配置会训练更多 backbone 参数。
+  freeze_at: -1         # 0 是部分基础配置中的常见默认值。
+  # False 表示 BN/Norm 层参与训练；小 batch 或分布不稳定时可考虑改回 True。
+  freeze_norm: False    # True 是部分基础配置中的常见默认值。
+
+# 将 decoder/transformer 内部激活函数切换为 SiLU。
+DFINETransformer:
+  activation: silu
+  mlp_act: silu
+
+# DEIM 使用的学习率调度参数。
+# 注意：这里保留项目已有键名 lrsheduler，虽然拼写不是 scheduler，但代码配置读取可能依赖该名称。
+lrsheduler: flatcosine
+# 学习率衰减系数；不同模型规格文件可能覆盖为 1.0 等值。
+lr_gamma: 0.5
+# warmup 的迭代步数，训练初期逐步升高学习率。
+warmup_iter: 2000
+# flatcosine 中保持平坦学习率的阶段长度，后续进入 cosine 衰减。
+flat_epoch: 29    # 经验设置：4 + epoch // 2，例如 40 = 4 + 72 / 2。
+# 最后若干 epoch 关闭强增广，用于更稳定地收敛和评估。
+no_aug_epoch: 8
+
+# DEIM 损失函数配置。
+DEIMCriterion:
+  # 各损失项权重：mal 为 DEIM 的匹配/分类相关损失，bbox/GIoU 约束框位置，
+  # fgl/ddf 为 D-FINE/DEIM 中用于精细定位分布学习的局部损失项。
+  weight_dict: {loss_mal: 1, loss_bbox: 5, loss_giou: 2, loss_fgl: 0.15, loss_ddf: 1.5}
+  # 启用的损失集合：分类/匹配、框回归、局部分布相关损失。
+  losses: ['mal', 'boxes', 'local']
+  # focal 类损失的 gamma，越大越强调难样本。
+  gamma: 1.5

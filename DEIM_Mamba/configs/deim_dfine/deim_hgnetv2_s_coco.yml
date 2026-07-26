@@ -1,0 +1,51 @@
+# DEIM HGNetv2-Small 在 COCO 上的训练配置。
+# 继承 D-FINE Small 规格后，再用 base/deim.yml 启用 DEIM 训练策略和损失。
+__include__: [
+  # Small 规格 D-FINE 基础配置。
+  './dfine_hgnetv2_s_coco.yml',
+  # DEIM 专用覆盖配置。
+  '../base/deim.yml'
+]
+
+# 当前 DEIM Small 实验输出目录。
+output_dir: ./outputs/deim_hgnetv2_s_coco
+
+optimizer:
+  type: AdamW
+  params: 
+    - 
+      # backbone 非 bn 参数使用较低学习率。
+      params: '^(?=.*backbone)(?!.*bn).*$'
+      lr: 0.0002
+    - 
+      # 所有 norm/bn 参数不做 weight decay；注释中说明 bias 不包含在该正则里。
+      params: '^(?=.*(?:norm|bn)).*$'     # 不包含 bias。
+      weight_decay: 0.
+
+  # 默认学习率，主要用于 encoder/decoder 主体参数。
+  lr: 0.0004
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+
+# 总训练轮数；120 轮后继续训练 12 轮，用于无强增广后期收敛和 EMA 搜索。
+epoches: 132 # 120 + 12
+
+# DEIM flatcosine 学习率调度覆盖。
+flat_epoch: 64    # 经验设置：4 + 120 / 2 = 64。
+# 最后 12 个 epoch 关闭强增广。
+no_aug_epoch: 12
+
+# DEIM 数据增强阶段覆盖。
+train_dataloader: 
+  dataset: 
+    transforms:
+      policy:
+        # 第 4、64、120 个 epoch 是增强策略的关键阶段节点。
+        epoch: [4, 64, 120]   # 阶段节点列表。
+
+  collate_fn:
+    # MixUp 在前两个阶段内启用。
+    mixup_epochs: [4, 64]
+    # 第 120 个 epoch 后停止多尺度/强混合增强。
+    stop_epoch: 120

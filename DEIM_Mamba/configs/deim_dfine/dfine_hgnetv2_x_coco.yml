@@ -1,0 +1,79 @@
+# D-FINE HGNetv2-X 在 COCO 上的训练配置。
+# X 是该组中最大的规格，使用 B5 主干、更宽的 encoder/decoder 和更保守的主干学习率。
+__include__: [
+  # COCO 数据集与评估器。
+  '../dataset/coco_detection.yml',
+  # 运行时默认值。
+  '../runtime.yml',
+  # DataLoader 与基础增强。
+  '../base/dataloader.yml',
+  # 优化器默认值。
+  '../base/optimizer.yml',
+  # 基础模型结构。
+  '../base/dfine_hgnetv2.yml',
+]
+
+# 当前实验输出目录。
+output_dir: ./output/dfine_hgnetv2_x_coco
+
+
+DEIM:
+  # 使用 HGNetv2 主干。
+  backbone: HGNetv2
+
+HGNetv2:
+  # B5 是 X 规格主干。
+  name: 'B5'
+  # 返回 3 个尺度特征。
+  return_idx: [1, 2, 3]
+  # 仅冻结 stem。
+  freeze_stem_only: True
+  # 冻结到第 0 阶段。
+  freeze_at: 0
+  # 冻结归一化层，提升大模型训练稳定性。
+  freeze_norm: True
+
+HybridEncoder:
+  # intra：X 规格使用更大的 hidden_dim 和 FFN 维度。
+  hidden_dim: 384
+  dim_feedforward: 2048
+
+DFINETransformer:
+  # decoder 输入通道与 X 规格 encoder hidden_dim 对齐。
+  feat_channels: [384, 384, 384]
+  # 更大的回归缩放范围，适配大模型定位能力。
+  reg_scale: 8
+
+optimizer:
+  type: AdamW
+  params:
+    -
+      # X 规格主干学习率极小，最大限度保留预训练特征。
+      params: '^(?=.*backbone)(?!.*norm|bn).*$'
+      lr: 0.0000025
+    -
+      # encoder/decoder 中 norm/bn 参数不做 weight decay。
+      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+
+  # 默认学习率，主要用于 encoder/decoder 非特殊分组参数。
+  lr: 0.00025
+  betas: [0.9, 0.999]
+  weight_decay: 0.000125
+
+
+# 总训练轮数；72 轮后额外训练 8 轮用于后期收敛/EMA 搜索。
+epoches: 80 # 72 + 8
+train_dataloader:
+  dataset:
+    transforms:
+      policy:
+        # 第 72 个 epoch 后停止强增广。
+        epoch: 72
+  collate_fn:
+    # collate 阶段同步停止多尺度/混合增强。
+    stop_epoch: 72
+    # X 规格这里使用略小的 EMA 重启衰减，让平均权重对后期更新更敏感。
+    ema_restart_decay: 0.9998
+    # 同一输入尺寸重复 3 次后再切换。
+    base_size_repeat: 3
