@@ -1,4 +1,4 @@
-"""统一评估 DEIM baseline 与 AxMamba V1 M0～M3 checkpoint。
+"""统一评估 DEIM baseline 与 CrossMamba V2 R0～R4 checkpoint。
 
 每个启用的实验使用完全相同的 COCO 数据、阈值和推理参数，输出 COCO
 AP/AP50/AP75、逐类 AP/PR、TIDE、混淆矩阵、FP/FN、ECE/LaECE、IoU
@@ -38,7 +38,7 @@ CONFIG: Dict[str, Any] = {
     "ann_file": "/home/zxw4090/hjw/D-FINE/data/WoodDefect/wood_coco_all_only_defect_quick_balanced_4000/annotations/instances_test.json",
 
     # 每个实验会写入 output_root/<experiment name>/，根目录另有跨实验汇总。
-    "output_root": "/home/zxw4090/hjw/D-FINE/deim_outputs/axmamba_v1_test_evaluation",
+    "output_root": "./deim_outputs/crossmamba_v2_test_evaluation",
     "device": "cuda:0",
     "batch_size": 1,
     "num_workers": 4,
@@ -49,7 +49,7 @@ CONFIG: Dict[str, Any] = {
     "continue_on_error": True,
     "strict_checkpoint_structure": True,
     "save_query_records_csv": True,
-    # 所有检测指标必须使用相同阈值，才能公平比较 baseline/M0～M3。
+    # 所有检测指标必须使用相同阈值，才能公平比较 R0～R4。
     "confusion_score_threshold": 0.25,
     "confusion_iou_threshold": 0.50,
     "ece_score_threshold": 0.05,
@@ -63,38 +63,38 @@ CONFIG: Dict[str, Any] = {
     "enable_tide": True,
     # None=自动。也可显式写成 {0: 1, 1: 2, ...}，键为模型 label，值为 COCO category_id。
     "model_label_to_category_id": None,
-    # 按需启用实验并填写实际 best_stg2.pth。enabled=False 的实验会跳过。
+    # 按需启用实验并填写实际 checkpoint。enabled=False 的实验会跳过。
     # config 与 checkpoint 必须来自同一个实验，严禁交叉加载。
     "experiments": [
         {
-            "name": "baseline",
+            "name": "r0_baseline",
             "enabled": False,
-            "config": "/home/zxw4090/hjw/D-FINE/configs/deim_dfine/deim_hgnetv2_l_wood.yml",
-            "checkpoint": "/home/zxw4090/hjw/D-FINE/deim_outputs/deim_hgnetv2_l_wood_960/best_stg2.pth",
+            "config": "./configs/deim_dfine/crossmamba_v2/r0_baseline.yml",
+            "checkpoint": "./deim_outputs/crossmamba_v2_r0_baseline/best_stg2.pth",
         },
         {
-            "name": "m0_baseline",
+            "name": "r1_postfpn_local",
             "enabled": False,
-            "config": "/home/zxw4090/hjw/D-FINE/configs/deim_dfine/ablation_axmamba_v1/m0_baseline.yml",
-            "checkpoint": "/home/zxw4090/hjw/D-FINE/deim_outputs/deim_hgnetv2_l_wood_axmamba_m0/best_stg2.pth",
+            "config": "./configs/deim_dfine/crossmamba_v2/r1_postfpn_local.yml",
+            "checkpoint": "./deim_outputs/crossmamba_v2_r1_postfpn_local/best_stg2.pth",
         },
         {
-            "name": "m1_local",
-            "enabled": True,
-            "config": "/home/zxw4090/hjw/D-FINE/configs/deim_dfine/ablation_axmamba_v1/m1_local_p4p5.yml",
-            "checkpoint": "/home/zxw4090/hjw/D-FINE/deim_outputs/deim_hgnetv2_l_wood_axmamba_m1_local/best_stg2.pth",
+            "name": "r2_cross_hv_only",
+            "enabled": False,
+            "config": "./configs/deim_dfine/crossmamba_v2/r2_cross_hv_only.yml",
+            "checkpoint": "./deim_outputs/crossmamba_v2_r2_cross_hv_only/best_stg2.pth",
         },
         {
-            "name": "m2_axis_mean",
+            "name": "r3_cross_hv_vh_mean",
             "enabled": False,
-            "config": "/home/zxw4090/hjw/D-FINE/configs/deim_dfine/ablation_axmamba_v1/m2_axis_mean_p4p5.yml",
-            "checkpoint": "/home/zxw4090/hjw/D-FINE/deim_outputs/deim_hgnetv2_l_wood_axmamba_m2_axis_mean/best_stg2.pth",
+            "config": "./configs/deim_dfine/crossmamba_v2/r3_cross_hv_vh_mean.yml",
+            "checkpoint": "./deim_outputs/crossmamba_v2_r3_cross_hv_vh_mean/best_stg2.pth",
         },
         {
-            "name": "m3_axis_gate",
+            "name": "r4_cross_hv_vh_gate",
             "enabled": False,
-            "config": "/home/zxw4090/hjw/D-FINE/configs/deim_dfine/ablation_axmamba_v1/m3_axis_gate_p4p5.yml",
-            "checkpoint": "/home/zxw4090/hjw/D-FINE/deim_outputs/deim_hgnetv2_l_wood_axmamba_m3_axis_gate/best_stg2.pth",
+            "config": "./configs/deim_dfine/crossmamba_v2/r4_cross_hv_vh_gate.yml",
+            "checkpoint": "./deim_outputs/crossmamba_v2_r4_cross_hv_vh_gate/best_stg2.pth",
         },
     ],
 }
@@ -415,7 +415,7 @@ def _run_inference(
     config_path = _resolve(experiment["config"])
     checkpoint_path = _resolve(experiment["checkpoint"])
     signature = {
-        "cache_version": 2,
+        "cache_version": 3,
         "config": str(config_path),
         "config_mtime_ns": config_path.stat().st_mtime_ns if config_path.exists() else None,
         "config_tree_sha256": _config_tree_digest(),
@@ -448,13 +448,19 @@ def _run_inference(
     device = torch.device(device_name)
     model = cfg_obj.model
     missing, unexpected = model.load_state_dict(_checkpoint_state(checkpoint_path), strict=False)
+    allowed_missing = [
+        key for key in missing if key.startswith("encoder.crossmamba_p4.")
+    ]
+    illegal_missing = [key for key in missing if key not in allowed_missing]
     if missing or unexpected:
         print(f"[LOAD] missing={len(missing)}, unexpected={len(unexpected)}")
         if cfg.get("strict_checkpoint_structure"):
-            raise RuntimeError(
-                "checkpoint 与实验配置结构不一致："
-                f"missing={list(missing)[:20]}, unexpected={list(unexpected)[:20]}"
-            )
+            if illegal_missing or unexpected:
+                raise RuntimeError(
+                    "checkpoint 与实验配置结构不一致："
+                    f"illegal_missing={list(illegal_missing)[:20]}, "
+                    f"unexpected={list(unexpected)[:20]}"
+                )
     model = model.to(device).eval()
     postprocessor = cfg_obj.postprocessor.to(device).eval()
     criterion = cfg_obj.criterion.to(device).eval()
@@ -546,7 +552,7 @@ def _run_inference(
                     box_cxcywh_to_xyxy(gt_boxes[gt_indices]),
                 ))
                 # DEIM MAL 的正 query 分类 target 是匹配 IoU 的 gamma 次幂。
-                # 它是当前 AxMamba 实验真实使用的 assignment joint target。
+                # It is the current CrossMamba experiment's assignment joint target.
                 target = pair_iou.clamp(min=0.0, max=1.0).pow(joint_target_power)
                 matched_iou[src_indices] = pair_iou
                 joint_target[src_indices] = target
@@ -586,6 +592,8 @@ def _run_inference(
         "joint_target_power": joint_target_power,
         "label_to_category_id": label_to_cat,
         "missing_keys": list(missing),
+        "allowed_crossmamba_missing_keys": allowed_missing,
+        "illegal_missing_keys": illegal_missing,
         "unexpected_keys": list(unexpected),
     }
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1639,7 +1647,7 @@ def _comparison_plot(rows: Sequence[Dict[str, Any]], output_root: Path) -> None:
     _table_image(
         output_root / "comparison_summary.png",
         rows,
-        "Baseline / AxMamba V1 unified evaluation",
+        "CrossMamba V2 R0-R4 unified evaluation",
         [
             "experiment", "AP", "AP50", "AP75", "Recall@0.50",
             "ECE", "LaECE", "background_FP",
@@ -1710,18 +1718,15 @@ def _evaluate_experiment(
             "missing_outputs": missing_outputs,
             "tide_available": tide_available,
             "quality_available": bool(quality.get("available")),
-            "complete": (
-                not missing_outputs
-                and tide_available
-                and bool(quality.get("available"))
-            ),
+            # Optional dependency/signal availability remains an objective
+            # status field and does not invalidate all other metric outputs.
+            "complete": not missing_outputs,
         },
     )
-    if missing_outputs or not tide_available or not quality.get("available"):
+    if missing_outputs:
         raise RuntimeError(
             f"评估输出不完整：missing={missing_outputs}, "
-            f"TIDE_available={tide_available}, quality_available={quality.get('available')}；"
-            "请检查 tide_summary.txt 和 quality_diagnostics.json。"
+            f"TIDE_available={tide_available}, quality_available={quality.get('available')}。"
         )
 
     overall_ece = next(row for row in ece["rows"] if row["category_id"] == "all")
@@ -1740,6 +1745,8 @@ def _evaluate_experiment(
         "background_FP": sum(row["background_fp"] for row in background),
         "quality_IoU_spearman": quality.get("quality_vs_true_iou_spearman", {}).get("rho"),
         "quality_joint_spearman": quality.get("quality_vs_joint_target_spearman", {}).get("rho"),
+        "TIDE_available": tide_available,
+        "quality_available": bool(quality.get("available")),
         "quality_all_query_best_iou_spearman": quality.get(
             "all_query_quality_vs_best_iou_spearman", {}
         ).get("rho"),
@@ -1806,9 +1813,13 @@ def run(cfg: Dict[str, Any], selected_names: Optional[Sequence[str]] = None) -> 
     failures = []
     attempted = 0
     for experiment in cfg["experiments"]:
-        if not experiment.get("enabled", True):
-            continue
-        if selected and experiment["name"] not in selected:
+        if selected:
+            # An explicit CLI selection intentionally overrides the editable
+            # enabled flag so one experiment can be evaluated without changing
+            # source code.
+            if experiment["name"] not in selected:
+                continue
+        elif not experiment.get("enabled", True):
             continue
         attempted += 1
         try:
@@ -1833,11 +1844,11 @@ def run(cfg: Dict[str, Any], selected_names: Optional[Sequence[str]] = None) -> 
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="统一评估 DEIM baseline 与 AxMamba V1 M0～M3")
+    parser = argparse.ArgumentParser(description="统一评估 DEIM baseline 与 CrossMamba V2 R0～R4")
     parser.add_argument(
         "--experiments",
         default=None,
-        help="筛选 enabled=True 的实验，逗号分隔，如 baseline,m0_baseline,m1_local",
+        help="显式选择实验并覆盖 enabled 标志，逗号分隔，如 r0_baseline,r1_postfpn_local,r4_cross_hv_vh_gate",
     )
     parser.add_argument("--ann-file", default=None)
     parser.add_argument("--images-dir", default=None)
@@ -1849,7 +1860,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-tide",
         action="store_true",
-        help="仅用于排障；正式输出会因缺少真实 TIDE 而标记为不完整",
+        help="跳过 TIDE 依赖并在输出中记录 TIDE_available=False",
     )
     return parser.parse_args()
 

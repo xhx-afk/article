@@ -8,13 +8,13 @@ Copyright (c) 2024 D-FINE Authors. All Rights Reserved.
 
 import copy
 from collections import OrderedDict
-from typing import Dict, Sequence
+from typing import Dict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .axmamba import AxMambaBlock
+from .axmamba import CrossMambaBlock
 from .utils import get_activation
 
 from ..core import register
@@ -302,49 +302,25 @@ class HybridEncoder(nn.Module):
                  act='silu',
                  eval_spatial_size=None,
                  version='dfine',
-                 use_axmamba: bool = False,
-                 axmamba_levels: Sequence[int] = (1, 2),
-                 axmamba_mode: str = 'axis_gate',
-                 axmamba_d_state: int = 16,
-                 axmamba_d_conv: int = 4,
-                 axmamba_expand: int = 2,
-                 axmamba_gate_reduction: int = 4,
-                 axmamba_gamma_init: float = 1e-3,
-                 axmamba_drop_path: float = 0.0,
-                 axmamba_collect_debug: bool = False,
+                 use_crossmamba: bool = False,
+                 crossmamba_d_state: int = 16,
+                 crossmamba_d_conv: int = 4,
+                 crossmamba_expand: int = 2,
+                 crossmamba_gate_reduction: int = 8,
+                 crossmamba_gamma_local_init: float = 1e-3,
+                 crossmamba_gamma_mamba_init: float = 1e-3,
+                 crossmamba_gate_bias_init: float = -2.0,
+                 crossmamba_drop_path: float = 0.0,
+                 crossmamba_use_gate: bool = True,
+                 crossmamba_use_hv: bool = True,
+                 crossmamba_use_vh: bool = True,
+                 crossmamba_collect_debug: bool = False,
                  ):
         super().__init__()
-        if not isinstance(use_axmamba, bool):
-            raise TypeError('use_axmamba must be a bool')
+        if not isinstance(use_crossmamba, bool):
+            raise TypeError('use_crossmamba must be a bool')
         if not isinstance(hidden_dim, int) or isinstance(hidden_dim, bool) or hidden_dim <= 0:
             raise ValueError('hidden_dim must be a positive integer')
-        if not isinstance(axmamba_levels, (list, tuple)):
-            raise TypeError('axmamba_levels must be a list or tuple of integers')
-        if any(not isinstance(level, int) or isinstance(level, bool) for level in axmamba_levels):
-            raise TypeError('each axmamba level must be an integer')
-        if len(set(axmamba_levels)) != len(axmamba_levels):
-            raise ValueError('axmamba_levels must not contain duplicates')
-        invalid_levels = [
-            level for level in axmamba_levels
-            if level < 0 or level >= len(in_channels)
-        ]
-        if invalid_levels:
-            raise ValueError(
-                'axmamba_levels {} are outside the valid range [0, {}]'.format(
-                    invalid_levels, len(in_channels) - 1
-                )
-            )
-        if axmamba_mode not in AxMambaBlock.VALID_MODES:
-            raise ValueError(
-                'axmamba_mode must be one of {}, got {!r}'.format(
-                    AxMambaBlock.VALID_MODES, axmamba_mode
-                )
-            )
-        if (
-            not isinstance(axmamba_gamma_init, (float, int))
-            or float(axmamba_gamma_init) < 0.0
-        ):
-            raise ValueError('axmamba_gamma_init must be non-negative')
 
         self.in_channels = in_channels
         self.feat_strides = feat_strides
@@ -355,8 +331,7 @@ class HybridEncoder(nn.Module):
         self.eval_spatial_size = eval_spatial_size
         self.out_channels = [hidden_dim for _ in range(len(in_channels))]
         self.out_strides = feat_strides
-        self.use_axmamba = use_axmamba
-        self.axmamba_levels = tuple(axmamba_levels)
+        self.use_crossmamba = use_crossmamba
 
         # channel projection
         self.input_proj = nn.ModuleList()
@@ -368,21 +343,24 @@ class HybridEncoder(nn.Module):
 
             self.input_proj.append(proj)
 
-        if self.use_axmamba:
-            self.axmamba_blocks = nn.ModuleDict({
-                str(level): AxMambaBlock(
-                    dim=hidden_dim,
-                    mode=axmamba_mode,
-                    d_state=axmamba_d_state,
-                    d_conv=axmamba_d_conv,
-                    expand=axmamba_expand,
-                    gate_reduction=axmamba_gate_reduction,
-                    gamma_init=axmamba_gamma_init,
-                    drop_path=axmamba_drop_path,
-                    collect_debug=axmamba_collect_debug,
-                )
-                for level in self.axmamba_levels
-            })
+        # CrossMamba V2 is deliberately created only when enabled.  This keeps
+        # the baseline architecture and checkpoint key space unchanged.
+        if self.use_crossmamba:
+            self.crossmamba_p4 = CrossMambaBlock(
+                dim=hidden_dim,
+                d_state=crossmamba_d_state,
+                d_conv=crossmamba_d_conv,
+                expand=crossmamba_expand,
+                gate_reduction=crossmamba_gate_reduction,
+                gamma_local_init=crossmamba_gamma_local_init,
+                gamma_mamba_init=crossmamba_gamma_mamba_init,
+                gate_bias_init=crossmamba_gate_bias_init,
+                drop_path=crossmamba_drop_path,
+                use_gate=crossmamba_use_gate,
+                use_hv=crossmamba_use_hv,
+                use_vh=crossmamba_use_vh,
+                collect_debug=crossmamba_collect_debug,
+            )
 
         # encoder transformer
         encoder_layer = TransformerEncoderLayer(
@@ -458,10 +436,6 @@ class HybridEncoder(nn.Module):
         assert len(feats) == len(self.in_channels)
         proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
 
-        if self.use_axmamba:
-            for level in self.axmamba_levels:
-                proj_feats[level] = self.axmamba_blocks[str(level)](proj_feats[level])
-
         # encoder
         if self.num_encoder_layers > 0:
             for i, enc_ind in enumerate(self.use_encoder_idx):
@@ -485,7 +459,13 @@ class HybridEncoder(nn.Module):
             feat_heigh = self.lateral_convs[len(self.in_channels) - 1 - idx](feat_heigh)
             inner_outs[0] = feat_heigh
             upsample_feat = F.interpolate(feat_heigh, scale_factor=2., mode='nearest')
-            inner_out = self.fpn_blocks[len(self.in_channels)-1-idx](torch.concat([upsample_feat, feat_low], dim=1))
+            block_idx = len(self.in_channels) - 1 - idx
+            inner_out = self.fpn_blocks[block_idx](torch.concat([upsample_feat, feat_low], dim=1))
+            # For [P3, P4, P5], idx == 2 is the first top-down fusion and
+            # therefore the fused P4 feature.  CrossMamba must not run on the
+            # projected inputs or on the later P3 fusion.
+            if self.use_crossmamba and idx == len(self.in_channels) - 1:
+                inner_out = self.crossmamba_p4(inner_out)
             inner_outs.insert(0, inner_out)
 
         outs = [inner_outs[0]]
@@ -498,11 +478,8 @@ class HybridEncoder(nn.Module):
 
         return outs
 
-    def get_axmamba_debug_state(self) -> Dict[str, Dict[str, torch.Tensor]]:
-        """Return latest detached AxMamba debug tensors keyed by feature level."""
-        if not self.use_axmamba:
+    def get_crossmamba_debug_state(self) -> Dict[str, torch.Tensor]:
+        """Return the latest detached CrossMamba P4 diagnostics."""
+        if not self.use_crossmamba:
             return {}
-        return {
-            str(level): self.axmamba_blocks[str(level)].get_debug_state()
-            for level in self.axmamba_levels
-        }
+        return self.crossmamba_p4.get_debug_state()

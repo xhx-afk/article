@@ -11,55 +11,6 @@ __include__:
     "../base/deim.yml",
   ]
 
-# # ==================== 用户可改配置区 ====================
-# # 实验输出目录。
-# output_dir: ./deim_outputs/deim_hgnetv2_l_wood_960
-
-# # Wood 数据集类别数，不包含背景类。
-# num_classes: 9
-# remap_mscoco_category: False
-
-# # 训练总轮数。注意 DEIM 训练代码读取字段名 epoches，不是 D-FINE 的 epochs。
-# epoches: 100
-
-# # DEIM 增强阶段节点。
-# stage_start_epoch: &stage_start_epoch 4
-# stage_middle_epoch: &stage_middle_epoch 40
-# # 第几个 epoch 后关闭 Mosaic/光照扰动/随机扩图/IoU 裁剪/MixUp/多尺度。
-# aug_stop_epoch: &aug_stop_epoch 72
-
-# # DEIM flatcosine 调度参数。
-# # flat_epoch 通常取 4 + aug_stop_epoch / 2；aug_stop_epoch=72 时为 40。
-# flat_epoch: *stage_middle_epoch
-# # no_aug_epoch = epoches - aug_stop_epoch；100 - 72 = 28。
-# no_aug_epoch: 28
-# lr_gamma: 0.5
-
-# # 训练和验证输入尺寸。评估尺寸必须和 val Resize 保持一致。
-# train_resize_size: &train_resize_size [960, 960]
-# eval_resize_size: &eval_resize_size [960, 960]
-# eval_spatial_size: *eval_resize_size
-
-# # collate 阶段使用的基础尺寸；当前多尺度实现使用单个整数，因此建议使用方形输入。
-# train_base_size: &train_base_size 960
-# # Mosaic 内部先把单张图缩放到该尺寸，再拼成 2x2；960 输入常用 480。
-# mosaic_output_size: &mosaic_output_size 480
-
-# # 多尺度训练开关：
-# #   关闭：base_size_repeat: ~
-# #   开启：base_size_repeat: 4   # 或其他正整数，表示基础尺寸重复次数
-# multiscale_repeat: &multiscale_repeat 4
-
-# # 全局 batch size；多卡训练时单卡 batch_size = total_batch_size / GPU 数量。
-# train_total_batch_size: &train_total_batch_size 12
-# val_total_batch_size: &val_total_batch_size 12
-
-# # Wood 数据路径，按实际机器位置修改。
-# train_img_folder: &train_img_folder /home/zxw4090/hjw/D-FINE/data/WoodDefect/wood_coco_all_only_defect/images/train
-# train_ann_file: &train_ann_file /home/zxw4090/hjw/D-FINE/data/WoodDefect/wood_coco_all_only_defect/annotations/instances_train.json
-# val_img_folder: &val_img_folder /home/zxw4090/hjw/D-FINE/data/WoodDefect/wood_coco_all_only_defect/images/val
-# val_ann_file: &val_ann_file /home/zxw4090/hjw/D-FINE/data/WoodDefect/wood_coco_all_only_defect/annotations/instances_val.json
-# # ========================================================
 # ==================== 用户可改配置区 ====================
 # 实验输出目录。
 output_dir: ./deim_outputs/deim_hgnetv2_l_wood_960
@@ -100,8 +51,8 @@ mosaic_output_size: &mosaic_output_size 480
 multiscale_repeat: &multiscale_repeat 4
 
 # 全局 batch size；多卡训练时单卡 batch_size = total_batch_size / GPU 数量。
-train_total_batch_size: &train_total_batch_size 8 #12
-val_total_batch_size: &val_total_batch_size 8 #12
+train_total_batch_size: &train_total_batch_size  8 #12
+val_total_batch_size: &val_total_batch_size  8 #12
 
 # Wood 数据路径，按实际机器位置修改。wood_coco_all_only_defect
 train_img_folder: &train_img_folder /home/zxw4090/hjw/D-FINE/data/WoodDefect/wood_coco_all_only_defect_quick_balanced_4000/images/train
