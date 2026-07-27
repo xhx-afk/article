@@ -1,14 +1,15 @@
-"""Post-FPN local-anchored CrossMamba V2 building blocks.
+"""LABS-Mamba V3 local anchor and bounded final-P4 sidecar.
 
-CrossMamba V2 applies shared-parameter H->V and V->H bidirectional axial
-Mamba paths to a fused P4 feature.  It has no semantic-map input and keeps the
-local multi-kernel branch as an independent residual update.
+The local anchor remains on the first top-down fused P4.  The Mamba adapter is
+a separate, single-path sidecar intended exclusively for the final PAN P4.
+This module deliberately contains no semantic input, content gate, or dual-path
+residual fusion.
 """
 
 from __future__ import annotations
 
-from collections import OrderedDict
-from typing import Dict
+import math
+from typing import Dict, Union
 
 import torch
 import torch.nn as nn
@@ -27,17 +28,16 @@ except Exception as exc:  # pragma: no cover - depends on the server environment
 __all__ = [
     "DropPath",
     "LayerNorm2d",
-    "LocalAnchorBranch",
+    "LocalAnchorBlock",
     "BidirectionalAxisMamba",
-    "BranchProjector",
-    "ContentAwareResidualGate",
-    "CrossMambaBlock",
+    "BoundedMambaSidecar",
 ]
 
 
 _MAMBA_UNAVAILABLE_MESSAGE = (
-    "CrossMamba is enabled with an axial path, but mamba_ssm is unavailable. "
-    "Install a build compatible with the existing PyTorch/CUDA environment."
+    "LABS-Mamba sidecar is enabled, but mamba_ssm is unavailable. Install a "
+    "mamba_ssm build compatible with the existing PyTorch/CUDA environment. "
+    "The S0 local-only configuration does not require mamba_ssm."
 )
 
 
@@ -67,63 +67,45 @@ def _validate_feature_map(x: torch.Tensor, dim: int, module_name: str) -> None:
 def _group_count(channels: int, maximum: int = 32) -> int:
     """Return the largest conventional GroupNorm group count that divides C."""
     _validate_positive_int("channels", channels)
-    _validate_positive_int("maximum", maximum)
     for groups in (32, 16, 8, 4, 2, 1):
         if groups <= maximum and groups <= channels and channels % groups == 0:
             return groups
     return 1
 
 
-class SafeGroupNorm(nn.GroupNorm):
-    """GroupNorm that remains defined for a single-sample singleton map.
-
-    PyTorch rejects a training-time GroupNorm call when each group contains
-    exactly one value (for example ``[1, C, 1, 1]`` with ``C`` groups).
-    CrossMamba must support such feature maps, so the fallback normalizes over
-    one group; for the degenerate one-channel case it applies the affine
-    parameters without attempting a zero-variance normalization.
-    """
+class _SafeGroupNorm(nn.GroupNorm):
+    """GroupNorm with a defined fallback for ``[1, C, 1, 1]`` inputs."""
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         values_per_group = input.numel() // self.num_groups
         if values_per_group > 1:
             return super().forward(input)
         if input.shape[1] > 1:
-            return F.group_norm(
-                input,
-                1,
-                self.weight,
-                self.bias,
-                self.eps,
-            )
+            return F.group_norm(input, 1, self.weight, self.bias, self.eps)
         weight = self.weight.reshape(1, 1, 1, 1)
         bias = self.bias.reshape(1, 1, 1, 1)
         return input * weight + bias
 
 
 class DropPath(nn.Module):
-    """Per-sample stochastic depth.
-
-    Input/output have identical arbitrary shapes, normally ``[B, C, H, W]``.
-    """
+    """Per-sample stochastic depth that preserves shape, dtype, and device."""
 
     def __init__(self, drop_prob: float = 0.0) -> None:
         super().__init__()
-        if not isinstance(drop_prob, (float, int)):
+        if not isinstance(drop_prob, (float, int)) or isinstance(drop_prob, bool):
             raise TypeError("drop_prob must be a number")
         if not 0.0 <= float(drop_prob) < 1.0:
             raise ValueError("drop_prob must be in [0, 1)")
         self.drop_prob = float(drop_prob)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply stochastic depth without changing shape, dtype, or device."""
         if not isinstance(x, torch.Tensor):
             raise TypeError("DropPath expects a torch.Tensor")
         if self.drop_prob == 0.0 or not self.training:
             return x
         keep_prob = 1.0 - self.drop_prob
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        mask = x.new_empty(shape).bernoulli_(keep_prob)
+        mask_shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        mask = x.new_empty(mask_shape).bernoulli_(keep_prob)
         return x * mask / keep_prob
 
 
@@ -139,7 +121,6 @@ class LayerNorm2d(nn.Module):
         self.norm = nn.LayerNorm(dim, eps=float(eps))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalize channels and preserve ``[B, C, H, W]``."""
         _validate_feature_map(x, self.dim, self.__class__.__name__)
         return (
             self.norm(x.permute(0, 2, 3, 1))
@@ -148,36 +129,59 @@ class LayerNorm2d(nn.Module):
         )
 
 
-class LocalAnchorBranch(nn.Module):
-    """Pre-normalized parallel 3x3/5x5 depthwise local anchor.
-
-    Shape: ``[B, C, H, W] -> [B, C, H, W]``.  Projection and GroupNorm are
-    intentionally performed by the branch-specific :class:`BranchProjector`.
-    """
+class _LocalAnchorBranch(nn.Module):
+    """Pre-normalized parallel 3x3/5x5 depthwise local features."""
 
     def __init__(self, dim: int) -> None:
         super().__init__()
-        _validate_positive_int("dim", dim)
         self.dim = dim
         self.pre_norm = LayerNorm2d(dim)
-        self.dw3 = nn.Conv2d(dim, dim, 3, stride=1, padding=1, groups=dim, bias=False)
-        self.dw5 = nn.Conv2d(dim, dim, 5, stride=1, padding=2, groups=dim, bias=False)
+        self.dw3 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False)
+        self.dw5 = nn.Conv2d(dim, dim, 5, padding=2, groups=dim, bias=False)
         self.act = nn.SiLU(inplace=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return local multi-kernel features with the input shape."""
         _validate_feature_map(x, self.dim, self.__class__.__name__)
         normalized = self.pre_norm(x)
         return self.act(self.dw3(normalized) + self.dw5(normalized))
 
 
-class BidirectionalAxisMamba(nn.Module):
-    """Shared-parameter forward/reverse Mamba scan on one spatial axis.
+class LocalAnchorBlock(nn.Module):
+    """Local multi-kernel residual anchor used on the first fused top-down P4."""
 
-    Shape: ``[B,C,H,W] -> [B,C,H,W]``.  Horizontal scans use
-    ``[B*H,W,C]`` and vertical scans use ``[B*W,H,C]``.  The same Mamba
-    parameters are shared by forward and reverse directions of one axis.
-    """
+    def __init__(
+        self,
+        dim: int = 256,
+        gamma_init: float = 0.001,
+        drop_path: float = 0.0,
+    ) -> None:
+        super().__init__()
+        _validate_positive_int("dim", dim)
+        if not isinstance(gamma_init, (float, int)) or isinstance(gamma_init, bool):
+            raise TypeError("gamma_init must be a number")
+        if float(gamma_init) < 0.0:
+            raise ValueError("gamma_init must be non-negative")
+        self.dim = dim
+        self.local_branch = _LocalAnchorBranch(dim)
+        self.projector = nn.Sequential(
+            nn.Conv2d(dim, dim, 1, bias=False),
+            _SafeGroupNorm(_group_count(dim), dim),
+        )
+        self.gamma_local = nn.Parameter(
+            torch.full((1, dim, 1, 1), float(gamma_init))
+        )
+        self.drop_path = DropPath(drop_path)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _validate_feature_map(x, self.dim, self.__class__.__name__)
+        local = self.projector(self.local_branch(x))
+        update = self.gamma_local.to(dtype=local.dtype) * local
+        output = x + self.drop_path(update)
+        return output if output.dtype == x.dtype else output.to(dtype=x.dtype)
+
+
+class BidirectionalAxisMamba(nn.Module):
+    """Vectorized forward/reverse Mamba scan along one spatial axis."""
 
     def __init__(
         self,
@@ -207,7 +211,6 @@ class BidirectionalAxisMamba(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalize and scan the configured axis in both directions."""
         _validate_feature_map(x, self.dim, self.__class__.__name__)
         batch, channels, height, width = x.shape
         input_dtype = x.dtype
@@ -223,279 +226,178 @@ class BidirectionalAxisMamba(nn.Module):
                 .contiguous()
                 .reshape(batch * width, height, channels)
             )
+
         sequence = self.norm(sequence)
         forward_features = self.mamba(sequence)
         reverse_features = torch.flip(
             self.mamba(torch.flip(sequence, dims=[1])), dims=[1]
         )
-        features = 0.5 * (forward_features + reverse_features)
-        if features.dtype != input_dtype:
-            features = features.to(dtype=input_dtype)
+        merged = 0.5 * (forward_features + reverse_features)
+
         if self.axis == "horizontal":
-            return (
-                features.reshape(batch, height, width, channels)
-                .permute(0, 3, 1, 2)
-                .contiguous()
-            )
-        return (
-            features.reshape(batch, width, height, channels)
-            .permute(0, 3, 2, 1)
-            .contiguous()
-        )
+            output = merged.reshape(batch, height, width, channels).permute(0, 3, 1, 2)
+        else:
+            output = merged.reshape(batch, width, height, channels).permute(0, 3, 2, 1)
+        output = output.contiguous()
+        return output if output.dtype == input_dtype else output.to(dtype=input_dtype)
 
 
-class BranchProjector(nn.Sequential):
-    """Independent 1x1 projection and GroupNorm for one ``[B,C,H,W]`` branch."""
-
-    def __init__(self, dim: int) -> None:
-        _validate_positive_int("dim", dim)
-        super().__init__(
-            OrderedDict(
-                [
-                    ("conv", nn.Conv2d(dim, dim, 1, bias=False)),
-                    ("norm", SafeGroupNorm(_group_count(dim), dim)),
-                ]
-            )
-        )
-
-
-class ContentAwareResidualGate(nn.Module):
-    """Independent candidate-aware sigmoid residual gate.
-
-    Inputs are reduced feature maps ``x``, local anchor and one CrossMamba
-    candidate, each ``[B, gate_dim, H, W]``.  Output is ``[B,1,H,W]``.
-    """
-
-    def __init__(self, gate_dim: int, bias_init: float = -2.0) -> None:
-        super().__init__()
-        _validate_positive_int("gate_dim", gate_dim)
-        if not isinstance(bias_init, (float, int)):
-            raise TypeError("bias_init must be a number")
-        self.gate_dim = gate_dim
-        self.net = nn.Sequential(
-            OrderedDict(
-                [
-                    ("conv_in", nn.Conv2d(5 * gate_dim, gate_dim, 1, bias=False)),
-                    ("norm", SafeGroupNorm(_group_count(gate_dim), gate_dim)),
-                    ("act", nn.SiLU(inplace=False)),
-                    ("conv_out", nn.Conv2d(gate_dim, 1, 1, bias=True)),
-                ]
-            )
-        )
-        nn.init.constant_(self.net.conv_out.bias, float(bias_init))
-
-    def forward(
-        self,
-        x_reduced: torch.Tensor,
-        local_reduced: torch.Tensor,
-        candidate_reduced: torch.Tensor,
-    ) -> torch.Tensor:
-        """Return an unconstrained-by-other-branches sigmoid gate."""
-        for name, tensor in (
-            ("x_reduced", x_reduced),
-            ("local_reduced", local_reduced),
-            ("candidate_reduced", candidate_reduced),
-        ):
-            _validate_feature_map(tensor, self.gate_dim, name)
-        if x_reduced.shape != local_reduced.shape or x_reduced.shape != candidate_reduced.shape:
-            raise ValueError("all reduced gate inputs must have identical shapes")
-        features = torch.cat(
-            [
-                x_reduced,
-                local_reduced,
-                candidate_reduced,
-                torch.abs(candidate_reduced - local_reduced),
-                candidate_reduced * local_reduced,
-            ],
-            dim=1,
-        )
-        return torch.sigmoid(self.net(features))
-
-
-class CrossMambaBlock(nn.Module):
-    """Local-anchored H->V / V->H CrossMamba residual block.
-
-    Input/output: ``[B,C,H,W] -> [B,C,H,W]``.  The local update never passes
-    through a gate.  Enabled CrossMamba candidates use independent sigmoid
-    gates, or fixed gates equal to one when ``use_gate=False``.
-    """
+class BoundedMambaSidecar(nn.Module):
+    """Low-dimensional, single-path, bounded Mamba residual for final PAN P4."""
 
     def __init__(
         self,
-        dim: int,
+        dim: int = 256,
+        bottleneck_dim: int = 64,
+        path: str = "hv",
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
-        gate_reduction: int = 8,
-        gamma_local_init: float = 1e-3,
-        gamma_mamba_init: float = 1e-3,
-        gate_bias_init: float = -2.0,
+        beta_init: float = 0.005,
+        beta_max: float = 0.05,
+        center_residual: bool = True,
+        rms_align: bool = True,
+        rms_eps: float = 1e-6,
+        max_align_scale: float = 10.0,
         drop_path: float = 0.0,
-        use_gate: bool = True,
-        use_hv: bool = True,
-        use_vh: bool = True,
         collect_debug: bool = False,
     ) -> None:
         super().__init__()
         _validate_positive_int("dim", dim)
+        _validate_positive_int("bottleneck_dim", bottleneck_dim)
         _validate_positive_int("d_state", d_state)
         _validate_positive_int("d_conv", d_conv)
         _validate_positive_int("expand", expand)
-        _validate_positive_int("gate_reduction", gate_reduction)
+        if path not in ("hv", "vh"):
+            raise ValueError("path must be 'hv' or 'vh'")
         for name, value in (
-            ("use_gate", use_gate),
-            ("use_hv", use_hv),
-            ("use_vh", use_vh),
+            ("center_residual", center_residual),
+            ("rms_align", rms_align),
             ("collect_debug", collect_debug),
         ):
             _validate_bool(name, value)
         for name, value in (
-            ("gamma_local_init", gamma_local_init),
-            ("gamma_mamba_init", gamma_mamba_init),
+            ("beta_init", beta_init),
+            ("beta_max", beta_max),
+            ("rms_eps", rms_eps),
+            ("max_align_scale", max_align_scale),
         ):
-            if not isinstance(value, (float, int)) or float(value) < 0.0:
-                raise ValueError("{} must be non-negative".format(name))
-        if not isinstance(gate_bias_init, (float, int)):
-            raise TypeError("gate_bias_init must be a number")
+            if not isinstance(value, (float, int)) or isinstance(value, bool):
+                raise TypeError("{} must be a number".format(name))
+        if not 0.0 < float(beta_init) < float(beta_max) <= 0.2:
+            raise ValueError("beta must satisfy 0 < beta_init < beta_max <= 0.2")
+        if float(rms_eps) <= 0.0:
+            raise ValueError("rms_eps must be positive")
+        if float(max_align_scale) < 1.0:
+            raise ValueError("max_align_scale must be at least 1")
 
         self.dim = dim
-        self.use_gate = use_gate
-        self.use_hv = use_hv
-        self.use_vh = use_vh
+        self.bottleneck_dim = bottleneck_dim
+        self.path = path
+        self.center_residual = center_residual
+        self.rms_align = rms_align
+        self.rms_eps = float(rms_eps)
+        self.max_align_scale = float(max_align_scale)
+        self.beta_max = float(beta_max)
         self.collect_debug = collect_debug
 
-        self.local_branch = LocalAnchorBranch(dim)
-        self.local_projector = BranchProjector(dim)
-        self.gamma_local = nn.Parameter(
-            torch.full((1, dim, 1, 1), float(gamma_local_init))
+        groups = _group_count(bottleneck_dim)
+        self.pre_norm = LayerNorm2d(dim)
+        self.reduce = nn.Sequential(
+            nn.Conv2d(dim, bottleneck_dim, 1, bias=False),
+            _SafeGroupNorm(groups, bottleneck_dim),
+            nn.SiLU(inplace=False),
+        )
+        self.horizontal = BidirectionalAxisMamba(
+            bottleneck_dim,
+            "horizontal",
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+        )
+        self.vertical = BidirectionalAxisMamba(
+            bottleneck_dim,
+            "vertical",
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+        )
+        self.expand = nn.Sequential(
+            nn.Conv2d(bottleneck_dim, dim, 1, bias=False),
+            _SafeGroupNorm(_group_count(dim), dim),
         )
 
-        if use_hv or use_vh:
-            self.pre_norm = LayerNorm2d(dim)
-            self.horizontal = BidirectionalAxisMamba(
-                dim, "horizontal", d_state=d_state, d_conv=d_conv, expand=expand
-            )
-            self.vertical = BidirectionalAxisMamba(
-                dim, "vertical", d_state=d_state, d_conv=d_conv, expand=expand
-            )
-
-        if use_hv:
-            self.hv_projector = BranchProjector(dim)
-            self.gamma_hv = nn.Parameter(
-                torch.full((1, dim, 1, 1), float(gamma_mamba_init))
-            )
-        if use_vh:
-            self.vh_projector = BranchProjector(dim)
-            self.gamma_vh = nn.Parameter(
-                torch.full((1, dim, 1, 1), float(gamma_mamba_init))
-            )
-
-        if use_gate and (use_hv or use_vh):
-            gate_dim = max(dim // gate_reduction, 32)
-            self.reduce_x = nn.Conv2d(dim, gate_dim, 1, bias=False)
-            self.reduce_local = nn.Conv2d(dim, gate_dim, 1, bias=False)
-            if use_hv:
-                self.reduce_hv = nn.Conv2d(dim, gate_dim, 1, bias=False)
-                self.gate_hv = ContentAwareResidualGate(gate_dim, gate_bias_init)
-            if use_vh:
-                self.reduce_vh = nn.Conv2d(dim, gate_dim, 1, bias=False)
-                self.gate_vh = ContentAwareResidualGate(gate_dim, gate_bias_init)
-
-        self.drop_path = DropPath(float(drop_path))
-        self.debug_state: Dict[str, torch.Tensor] = {}
+        raw_init = math.atanh(float(beta_init) / self.beta_max)
+        self.beta_raw = nn.Parameter(torch.tensor(raw_init, dtype=torch.float32))
+        self.drop_path = DropPath(drop_path)
+        self.debug_state = {}  # type: Dict[str, Union[str, torch.Tensor]]
 
     @staticmethod
-    def _rms(x: torch.Tensor) -> torch.Tensor:
-        detached = x.detach().float()
-        return torch.sqrt(torch.mean(detached * detached))
+    def _sample_rms(value: torch.Tensor, eps: float = 0.0) -> torch.Tensor:
+        squared_mean = value.float().pow(2).mean(dim=(1, 2, 3), keepdim=True)
+        return torch.sqrt(squared_mean + eps)
 
-    @staticmethod
-    def _quantiles(x: torch.Tensor) -> torch.Tensor:
-        flattened = x.detach().float().reshape(-1)
-        levels = flattened.new_tensor([0.1, 0.5, 0.9])
-        return torch.quantile(flattened, levels)
-
-    @staticmethod
-    def _scaled(parameter: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
-        return parameter.to(dtype=value.dtype) * value
+    def effective_beta(self) -> torch.Tensor:
+        """Return the differentiable, globally scalar bounded beta."""
+        return self.beta_max * torch.tanh(self.beta_raw)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply local anchor plus enabled sequential cross-axis increments."""
         _validate_feature_map(x, self.dim, self.__class__.__name__)
-        local = self.local_projector(self.local_branch(x))
-        local_update = self._scaled(self.gamma_local, local)
-        residual_update = local_update
+        reduced = self.reduce(self.pre_norm(x))
+        if self.path == "hv":
+            candidate = self.vertical(self.horizontal(reduced))
+        else:
+            candidate = self.horizontal(self.vertical(reduced))
+        candidate = self.expand(candidate)
 
-        zero = x.detach().float().new_zeros(())
-        one_gate = x.new_ones((x.shape[0], 1, x.shape[2], x.shape[3]))
-        hv = None
-        vh = None
-        hv_update = None
-        vh_update = None
-        gate_hv = None
-        gate_vh = None
+        candidate_mean_before = candidate.float().mean(dim=(2, 3), keepdim=True)
+        if self.center_residual:
+            candidate = candidate - candidate.mean(dim=(2, 3), keepdim=True)
+        candidate_mean_after = candidate.float().mean(dim=(2, 3), keepdim=True)
 
-        if self.use_hv or self.use_vh:
-            normalized = self.pre_norm(x)
-            if self.use_hv:
-                hv = self.hv_projector(self.vertical(self.horizontal(normalized)))
-            if self.use_vh:
-                vh = self.vh_projector(self.horizontal(self.vertical(normalized)))
+        input_rms = self._sample_rms(x, self.rms_eps)
+        candidate_raw_rms = self._sample_rms(candidate, self.rms_eps)
+        if self.rms_align:
+            align_scale = (
+                input_rms.detach() / candidate_raw_rms.detach()
+            ).clamp(max=self.max_align_scale)
+            candidate = candidate * align_scale.to(dtype=candidate.dtype)
+        candidate_aligned_rms = self._sample_rms(candidate, self.rms_eps)
 
-            if self.use_gate:
-                x_reduced = self.reduce_x(x)
-                local_reduced = self.reduce_local(local)
-                if self.use_hv:
-                    gate_hv = self.gate_hv(
-                        x_reduced, local_reduced, self.reduce_hv(hv)
-                    )
-                if self.use_vh:
-                    gate_vh = self.gate_vh(
-                        x_reduced, local_reduced, self.reduce_vh(vh)
-                    )
-            else:
-                gate_hv = one_gate if self.use_hv else None
-                gate_vh = one_gate if self.use_vh else None
-
-            if self.use_hv:
-                hv_update = self._scaled(self.gamma_hv, gate_hv * hv)
-                residual_update = residual_update + hv_update
-            if self.use_vh:
-                vh_update = self._scaled(self.gamma_vh, gate_vh * vh)
-                residual_update = residual_update + vh_update
-
-        output = x + self.drop_path(residual_update)
+        beta = self.effective_beta()
+        update = beta.to(dtype=candidate.dtype) * candidate
+        output = x + self.drop_path(update)
         if output.dtype != x.dtype:
             output = output.to(dtype=x.dtype)
 
         if self.collect_debug:
-            hv_quantiles = (
-                self._quantiles(gate_hv) if gate_hv is not None else zero.repeat(3)
-            )
-            vh_quantiles = (
-                self._quantiles(gate_vh) if gate_vh is not None else zero.repeat(3)
-            )
+            update_rms = self._sample_rms(update)
             self.debug_state = {
-                "gamma_local_mean": self.gamma_local.detach().mean(),
-                "gamma_hv_mean": self.gamma_hv.detach().mean() if self.use_hv else zero,
-                "gamma_vh_mean": self.gamma_vh.detach().mean() if self.use_vh else zero,
-                "gate_hv_mean": gate_hv.detach().mean() if gate_hv is not None else zero,
-                "gate_vh_mean": gate_vh.detach().mean() if gate_vh is not None else zero,
-                "gate_hv_q10": hv_quantiles[0],
-                "gate_hv_q50": hv_quantiles[1],
-                "gate_hv_q90": hv_quantiles[2],
-                "gate_vh_q10": vh_quantiles[0],
-                "gate_vh_q50": vh_quantiles[1],
-                "gate_vh_q90": vh_quantiles[2],
-                "local_rms": self._rms(local),
-                "hv_rms": self._rms(hv) if hv is not None else zero,
-                "vh_rms": self._rms(vh) if vh is not None else zero,
-                "local_update_rms": self._rms(local_update),
-                "hv_update_rms": self._rms(hv_update) if hv_update is not None else zero,
-                "vh_update_rms": self._rms(vh_update) if vh_update is not None else zero,
+                "path": self.path,
+                "beta_effective": beta.detach(),
+                "input_rms": input_rms.detach().reshape(-1),
+                "candidate_raw_rms": candidate_raw_rms.detach().reshape(-1),
+                "candidate_aligned_rms": candidate_aligned_rms.detach().reshape(-1),
+                "update_rms": update_rms.detach().reshape(-1),
+                "update_input_ratio": (
+                    update_rms / (input_rms + self.rms_eps)
+                ).detach().reshape(-1),
+                "input_spatial_mean_abs": x.detach().float().mean(
+                    dim=(2, 3)
+                ).abs().mean(),
+                "input_spatial_mean": x.detach().float().mean(),
+                "candidate_spatial_mean_abs_before_center": candidate_mean_before.detach().abs().mean(),
+                "candidate_spatial_mean_abs_after_center": candidate_mean_after.detach().abs().mean(),
+                "input_std": x.detach().float().std(unbiased=False),
+                "output_std": output.detach().float().std(unbiased=False),
+                "output_spatial_mean": output.detach().float().mean(),
+                "feature_delta_mean_abs": (output.detach().float() - x.detach().float()).abs().mean(),
             }
         return output
 
-    def get_debug_state(self) -> Dict[str, torch.Tensor]:
-        """Return detached tensors recorded by the latest debug forward."""
-        return {name: value.detach() for name, value in self.debug_state.items()}
+    def get_debug_state(self) -> Dict[str, Union[str, torch.Tensor]]:
+        """Return detached tensors from the latest debug-enabled forward."""
+        state = {}  # type: Dict[str, Union[str, torch.Tensor]]
+        for name, value in self.debug_state.items():
+            state[name] = value.detach() if isinstance(value, torch.Tensor) else value
+        return state

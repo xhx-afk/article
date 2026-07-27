@@ -22,6 +22,49 @@ from ..optim.lr_scheduler import FlatCosineLRScheduler
 
 class DetSolver(BaseSolver):
 
+    @staticmethod
+    def _labs_debug_log(model):
+        """Convert the latest sidecar debug state to epoch-level scalar logs."""
+        encoder = getattr(model, 'encoder', None)
+        getter = getattr(encoder, 'get_labs_mamba_debug_state', None)
+        if getter is None:
+            return {}
+        state = getter()
+        if not state:
+            return {}
+
+        def scalar(value):
+            if isinstance(value, torch.Tensor):
+                return float(value.detach().float().mean().item())
+            return value
+
+        fields = (
+            'beta_effective', 'input_rms', 'candidate_raw_rms',
+            'candidate_aligned_rms', 'update_rms', 'update_input_ratio',
+            'candidate_spatial_mean_abs_before_center',
+            'candidate_spatial_mean_abs_after_center', 'input_spatial_mean',
+            'output_spatial_mean', 'input_std', 'output_std',
+        )
+        result = {}
+        for field in fields:
+            if field in state:
+                result['labs_' + field] = scalar(state[field])
+        if 'input_std' in state and 'output_std' in state:
+            result['labs_P4_before_std'] = scalar(state['input_std'])
+            result['labs_P4_after_std'] = scalar(state['output_std'])
+        if 'input_spatial_mean' in state and 'output_spatial_mean' in state:
+            result['labs_P4_before_mean'] = scalar(state['input_spatial_mean'])
+            result['labs_P4_after_mean'] = scalar(state['output_spatial_mean'])
+        if 'candidate_spatial_mean_abs_before_center' in state:
+            result['labs_candidate_mean_before_center'] = scalar(
+                state['candidate_spatial_mean_abs_before_center']
+            )
+        if 'candidate_spatial_mean_abs_after_center' in state:
+            result['labs_candidate_mean_after_center'] = scalar(
+                state['candidate_spatial_mean_abs_after_center']
+            )
+        return result
+
     def _load_stage1_checkpoint(self):
         """在阶段切换时安全恢复 stg1 best，损坏时回退并自动修复。"""
         primary = self.output_dir / 'best_stg1.pth'
@@ -178,6 +221,10 @@ class DetSolver(BaseSolver):
                 'epoch': epoch,
                 'n_parameters': n_parameters
             }
+            # The sidecar records detached, tiny diagnostics on its latest
+            # training forward.  Write one scalar row per epoch when enabled.
+            if dist_utils.is_main_process():
+                log_stats.update(self._labs_debug_log(self.model))
 
             if self.output_dir and dist_utils.is_main_process():
                 with (self.output_dir / "log.txt").open("a") as f:

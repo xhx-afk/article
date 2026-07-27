@@ -8,13 +8,11 @@ Copyright (c) 2024 D-FINE Authors. All Rights Reserved.
 
 import copy
 from collections import OrderedDict
-from typing import Dict
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .axmamba import CrossMambaBlock
+from .axmamba import BoundedMambaSidecar, LocalAnchorBlock
 from .utils import get_activation
 
 from ..core import register
@@ -302,25 +300,31 @@ class HybridEncoder(nn.Module):
                  act='silu',
                  eval_spatial_size=None,
                  version='dfine',
-                 use_crossmamba: bool = False,
-                 crossmamba_d_state: int = 16,
-                 crossmamba_d_conv: int = 4,
-                 crossmamba_expand: int = 2,
-                 crossmamba_gate_reduction: int = 8,
-                 crossmamba_gamma_local_init: float = 1e-3,
-                 crossmamba_gamma_mamba_init: float = 1e-3,
-                 crossmamba_gate_bias_init: float = -2.0,
-                 crossmamba_drop_path: float = 0.0,
-                 crossmamba_use_gate: bool = True,
-                 crossmamba_use_hv: bool = True,
-                 crossmamba_use_vh: bool = True,
-                 crossmamba_collect_debug: bool = False,
+                 use_local_anchor: bool = False,
+                 use_mamba_sidecar: bool = False,
+                 mamba_sidecar_path: str = 'hv',
+                 mamba_sidecar_bottleneck_dim: int = 64,
+                 mamba_sidecar_d_state: int = 16,
+                 mamba_sidecar_d_conv: int = 4,
+                 mamba_sidecar_expand: int = 2,
+                 mamba_sidecar_beta_init: float = 0.005,
+                 mamba_sidecar_beta_max: float = 0.05,
+                 mamba_sidecar_center_residual: bool = True,
+                 mamba_sidecar_rms_align: bool = True,
+                 mamba_sidecar_max_align_scale: float = 10.0,
+                 mamba_sidecar_drop_path: float = 0.0,
+                 mamba_sidecar_collect_debug: bool = False,
+                 local_anchor_gamma_init: float = 0.001,
                  ):
         super().__init__()
-        if not isinstance(use_crossmamba, bool):
-            raise TypeError('use_crossmamba must be a bool')
+        if not isinstance(use_local_anchor, bool):
+            raise TypeError('use_local_anchor must be a bool')
+        if not isinstance(use_mamba_sidecar, bool):
+            raise TypeError('use_mamba_sidecar must be a bool')
         if not isinstance(hidden_dim, int) or isinstance(hidden_dim, bool) or hidden_dim <= 0:
             raise ValueError('hidden_dim must be a positive integer')
+        if use_mamba_sidecar and len(in_channels) != 3:
+            raise ValueError('LABS-Mamba final-P4 sidecar requires exactly P3/P4/P5 inputs')
 
         self.in_channels = in_channels
         self.feat_strides = feat_strides
@@ -331,7 +335,8 @@ class HybridEncoder(nn.Module):
         self.eval_spatial_size = eval_spatial_size
         self.out_channels = [hidden_dim for _ in range(len(in_channels))]
         self.out_strides = feat_strides
-        self.use_crossmamba = use_crossmamba
+        self.use_local_anchor = use_local_anchor
+        self.use_mamba_sidecar = use_mamba_sidecar
 
         # channel projection
         self.input_proj = nn.ModuleList()
@@ -343,23 +348,29 @@ class HybridEncoder(nn.Module):
 
             self.input_proj.append(proj)
 
-        # CrossMamba V2 is deliberately created only when enabled.  This keeps
-        # the baseline architecture and checkpoint key space unchanged.
-        if self.use_crossmamba:
-            self.crossmamba_p4 = CrossMambaBlock(
+        # The local anchor reproduces the validated first-fused-P4 local path.
+        # It is independent from the final-P4 Mamba sidecar.
+        if self.use_local_anchor:
+            self.local_anchor_p4 = LocalAnchorBlock(
                 dim=hidden_dim,
-                d_state=crossmamba_d_state,
-                d_conv=crossmamba_d_conv,
-                expand=crossmamba_expand,
-                gate_reduction=crossmamba_gate_reduction,
-                gamma_local_init=crossmamba_gamma_local_init,
-                gamma_mamba_init=crossmamba_gamma_mamba_init,
-                gate_bias_init=crossmamba_gate_bias_init,
-                drop_path=crossmamba_drop_path,
-                use_gate=crossmamba_use_gate,
-                use_hv=crossmamba_use_hv,
-                use_vh=crossmamba_use_vh,
-                collect_debug=crossmamba_collect_debug,
+                gamma_init=local_anchor_gamma_init,
+            )
+
+        if self.use_mamba_sidecar:
+            self.mamba_sidecar_p4 = BoundedMambaSidecar(
+                dim=hidden_dim,
+                bottleneck_dim=mamba_sidecar_bottleneck_dim,
+                path=mamba_sidecar_path,
+                d_state=mamba_sidecar_d_state,
+                d_conv=mamba_sidecar_d_conv,
+                expand=mamba_sidecar_expand,
+                beta_init=mamba_sidecar_beta_init,
+                beta_max=mamba_sidecar_beta_max,
+                center_residual=mamba_sidecar_center_residual,
+                rms_align=mamba_sidecar_rms_align,
+                max_align_scale=mamba_sidecar_max_align_scale,
+                drop_path=mamba_sidecar_drop_path,
+                collect_debug=mamba_sidecar_collect_debug,
             )
 
         # encoder transformer
@@ -461,11 +472,10 @@ class HybridEncoder(nn.Module):
             upsample_feat = F.interpolate(feat_heigh, scale_factor=2., mode='nearest')
             block_idx = len(self.in_channels) - 1 - idx
             inner_out = self.fpn_blocks[block_idx](torch.concat([upsample_feat, feat_low], dim=1))
-            # For [P3, P4, P5], idx == 2 is the first top-down fusion and
-            # therefore the fused P4 feature.  CrossMamba must not run on the
-            # projected inputs or on the later P3 fusion.
-            if self.use_crossmamba and idx == len(self.in_channels) - 1:
-                inner_out = self.crossmamba_p4(inner_out)
+            # For [P3, P4, P5], the first top-down fusion is fused P4.  Only
+            # the local anchor belongs here; Mamba must wait for the final PAN.
+            if self.use_local_anchor and idx == len(self.in_channels) - 1:
+                inner_out = self.local_anchor_p4(inner_out)
             inner_outs.insert(0, inner_out)
 
         outs = [inner_outs[0]]
@@ -476,10 +486,15 @@ class HybridEncoder(nn.Module):
             out = self.pan_blocks[idx](torch.concat([downsample_feat, feat_height], dim=1))
             outs.append(out)
 
+        # PAN is complete and outs is [P3, P4, P5].  The sidecar changes only
+        # final P4, so enabling it cannot feed back into P3 or P5 construction.
+        if self.use_mamba_sidecar:
+            outs[1] = self.mamba_sidecar_p4(outs[1])
+
         return outs
 
-    def get_crossmamba_debug_state(self) -> Dict[str, torch.Tensor]:
-        """Return the latest detached CrossMamba P4 diagnostics."""
-        if not self.use_crossmamba:
+    def get_labs_mamba_debug_state(self):
+        """Return diagnostics from the final-P4 sidecar, when enabled."""
+        if not self.use_mamba_sidecar:
             return {}
-        return self.crossmamba_p4.get_debug_state()
+        return self.mamba_sidecar_p4.get_debug_state()

@@ -1,0 +1,42 @@
+# LABS-Mamba V3 / S5：最佳单路径的 residual-centering 消融。
+# 当前文件给出 HV/b64 可执行模板；只有 S1 为最佳路径时可原样运行。
+# 若 S2(VH) 或 b128 胜出，必须先把 path/bottleneck_dim 改为对应最佳设置，
+# 且仍从同一 S0 checkpoint warm-start，只关闭 centering 这一项。
+__include__:
+  - ../deim_hgnetv2_l_wood.yml
+
+output_dir: ./deim_outputs/labs_mamba_v3_s5_best_no_center
+epoches: 50
+
+HybridEncoder:
+  use_local_anchor: true
+  use_mamba_sidecar: true
+  mamba_sidecar_path: hv
+  mamba_sidecar_bottleneck_dim: 64
+  mamba_sidecar_d_state: 16
+  mamba_sidecar_d_conv: 4
+  mamba_sidecar_expand: 2
+  mamba_sidecar_beta_init: 0.005
+  mamba_sidecar_beta_max: 0.05
+  # S5 唯一的结构性消融开关：关闭候选残差空间中心化。
+  mamba_sidecar_center_residual: false
+  mamba_sidecar_rms_align: true
+  mamba_sidecar_max_align_scale: 10.0
+  mamba_sidecar_drop_path: 0.0
+  mamba_sidecar_collect_debug: true
+  local_anchor_gamma_init: 0.001
+
+optimizer:
+  params:
+    - params: "^(?=.*backbone)(?!.*norm|bn).*$"
+      lr: 0.0000125
+    - params: "^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn))(?!.*mamba_sidecar_p4).*$"
+      weight_decay: 0.
+    - params: "^encoder\\.mamba_sidecar_p4\\..*$"
+      lr: 0.00025
+
+# 最佳路径确认并同步上面两个字段后再执行：
+# CUDA_VISIBLE_DEVICES=0,2 torchrun --master_port=7795 --nproc_per_node=2 train.py \
+#   -c configs/deim_dfine/labs_mamba_v3/s5_best_path_center_ablation.yml \
+#   -t /home/zxw4090/hjw/DEIM_Mamba/deim_outputs/labs_mamba_v3_s0_local_anchor/best_stg2.pth \
+#   --use-amp --seed=0

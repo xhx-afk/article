@@ -1,0 +1,45 @@
+# LABS-Mamba V3 / S2：与 S1 相同，只把单路径顺序改为 VH。
+# 必须与 S1 使用同一个已收敛 S0 checkpoint 进行 -t warm-start。
+__include__:
+  - ../deim_hgnetv2_l_wood.yml
+
+output_dir: ./deim_outputs/labs_mamba_v3_s2_vh_b64
+epoches: 50
+
+HybridEncoder:
+  use_local_anchor: true
+  use_mamba_sidecar: true
+  # VH = horizontal(vertical(reduced_final_P4))。
+  mamba_sidecar_path: vh
+  mamba_sidecar_bottleneck_dim: 64
+  mamba_sidecar_d_state: 16
+  mamba_sidecar_d_conv: 4
+  mamba_sidecar_expand: 2
+  mamba_sidecar_beta_init: 0.005
+  mamba_sidecar_beta_max: 0.05
+  mamba_sidecar_center_residual: true
+  mamba_sidecar_rms_align: true
+  mamba_sidecar_max_align_scale: 10.0
+  mamba_sidecar_drop_path: 0.0
+  mamba_sidecar_collect_debug: true
+  local_anchor_gamma_init: 0.001
+
+optimizer:
+  params:
+    - params: "^(?=.*backbone)(?!.*norm|bn).*$"
+      lr: 0.0000125
+    - params: "^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn))(?!.*mamba_sidecar_p4).*$"
+      weight_decay: 0.
+    - params: "^encoder\\.mamba_sidecar_p4\\..*$"
+      lr: 0.00025
+
+# 权重审计：
+# python tools/debug/load_s0_for_sidecar.py \
+#   --config configs/deim_dfine/labs_mamba_v3/s2_vh_sidecar_b64.yml \
+#   --checkpoint /home/zxw4090/hjw/DEIM_Mamba/deim_outputs/labs_mamba_v3_s0_local_anchor/best_stg2.pth
+
+# 双卡 warm-start 训练：
+# CUDA_VISIBLE_DEVICES=0,2 torchrun --master_port=7792 --nproc_per_node=2 train.py \
+#   -c configs/deim_dfine/labs_mamba_v3/s2_vh_sidecar_b64.yml \
+#   -t /home/zxw4090/hjw/DEIM_Mamba/deim_outputs/labs_mamba_v3_s0_local_anchor/best_stg2.pth \
+#   --use-amp --seed=0

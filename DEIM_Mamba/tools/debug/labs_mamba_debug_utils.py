@@ -1,11 +1,11 @@
-"""Shared helpers for CrossMamba V2 validation and profiling scripts."""
+"""Shared LABS-Mamba V3 checkpoint, model, and smoke-test helpers."""
 
 from __future__ import annotations
 
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List, Mapping
+from typing import Dict, List, Mapping, Sequence
 
 import torch
 
@@ -15,11 +15,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
-CROSSMAMBA_PREFIX = "encoder.crossmamba_p4."
+LOCAL_PREFIX = "encoder.local_anchor_p4."
+SIDECAR_PREFIX = "encoder.mamba_sidecar_p4."
+LABS_PREFIXES = (LOCAL_PREFIX, SIDECAR_PREFIX)
 
 
 def build_config(config_path: str, **overrides):
-    """Build a YAMLConfig without downloading backbone pretrained weights."""
+    """Build YAMLConfig without downloading backbone pretrained weights."""
     from engine.core import YAMLConfig
 
     cfg = YAMLConfig(config_path, **overrides)
@@ -29,20 +31,19 @@ def build_config(config_path: str, **overrides):
 
 
 def extract_checkpoint_state(checkpoint) -> Mapping[str, torch.Tensor]:
-    """Extract model weights from DEIM model/EMA or a raw state dictionary."""
+    """Match train.py -t semantics: prefer EMA, then model, then raw weights."""
     if not isinstance(checkpoint, Mapping):
         raise TypeError("checkpoint must be a mapping")
     state = None
-    if "ema" in checkpoint:
-        ema = checkpoint["ema"]
-        if isinstance(ema, Mapping) and "module" in ema:
-            state = ema["module"]
-    if "model" in checkpoint and isinstance(checkpoint["model"], Mapping):
+    ema = checkpoint.get("ema")
+    if isinstance(ema, Mapping) and isinstance(ema.get("module"), Mapping):
+        state = ema["module"]
+    elif isinstance(checkpoint.get("model"), Mapping):
         state = checkpoint["model"]
-    if state is None and all(isinstance(key, str) for key in checkpoint):
+    elif checkpoint and all(isinstance(key, str) for key in checkpoint):
         state = checkpoint
-    if state is None or not isinstance(state, Mapping):
-        raise ValueError("cannot locate model/ema weights in checkpoint")
+    if state is None:
+        raise ValueError("cannot locate EMA/model/raw model weights in checkpoint")
     return {
         key[7:] if key.startswith("module.") else key: value
         for key, value in state.items()
@@ -50,45 +51,79 @@ def extract_checkpoint_state(checkpoint) -> Mapping[str, torch.Tensor]:
 
 
 def load_checkpoint(path: str) -> Mapping[str, torch.Tensor]:
-    """Load a checkpoint on CPU and return its model state."""
     return extract_checkpoint_state(torch.load(path, map_location="cpu"))
 
 
-def audit_checkpoint_load(model, state: Mapping[str, torch.Tensor]) -> Dict[str, object]:
-    """Load non-strictly and verify that only CrossMamba V2 keys are missing."""
-    incompatible = model.load_state_dict(state, strict=False)
-    missing = sorted(incompatible.missing_keys)
-    unexpected = sorted(incompatible.unexpected_keys)
-    illegal_missing = [key for key in missing if not key.startswith(CROSSMAMBA_PREFIX)]
-    report = {
-        "missing_keys": missing,
-        "unexpected_keys": unexpected,
-        "allowed_crossmamba_missing_keys": [
-            key for key in missing if key.startswith(CROSSMAMBA_PREFIX)
+def audit_checkpoint_load(
+    model,
+    state: Mapping[str, torch.Tensor],
+    require_all_sidecar_missing: bool = False,
+) -> Dict[str, object]:
+    """Load shape-compatible keys and fully audit the non-strict result."""
+    model_state = model.state_dict()
+    unexpected = sorted(key for key in state if key not in model_state)
+    shape_mismatches = sorted(
+        [
+        {
+            "key": key,
+            "checkpoint_shape": list(value.shape),
+            "model_shape": list(model_state[key].shape),
+        }
+        for key, value in state.items()
+        if key in model_state and tuple(value.shape) != tuple(model_state[key].shape)
         ],
-        "illegal_missing_keys": illegal_missing,
-        "compatible": not illegal_missing and not unexpected,
+        key=lambda row: row["key"],
+    )
+    mismatch_names = {row["key"] for row in shape_mismatches}
+    compatible_state = {
+        key: value
+        for key, value in state.items()
+        if key in model_state and key not in mismatch_names
     }
-    return report
+    incompatible = model.load_state_dict(compatible_state, strict=False)
+    missing = sorted(set(incompatible.missing_keys) | mismatch_names)
+    sidecar_model_keys = sorted(
+        key for key in model_state if key.startswith(SIDECAR_PREFIX)
+    )
+    allowed_missing = [key for key in missing if key.startswith(SIDECAR_PREFIX)]
+    illegal_missing = [key for key in missing if not key.startswith(SIDECAR_PREFIX)]
+    all_sidecar_missing = bool(sidecar_model_keys) and allowed_missing == sidecar_model_keys
+    compatible = not illegal_missing and not unexpected and not shape_mismatches
+    if require_all_sidecar_missing:
+        compatible = compatible and all_sidecar_missing
+    return {
+        "model_key_count": len(model_state),
+        "checkpoint_key_count": len(state),
+        "loaded_key_count": len(compatible_state),
+        "missing_keys": missing,
+        "allowed_sidecar_missing_keys": allowed_missing,
+        "illegal_missing_keys": illegal_missing,
+        "unexpected_keys": unexpected,
+        "shape_mismatches": shape_mismatches,
+        "sidecar_model_keys": sidecar_model_keys,
+        "all_sidecar_keys_missing": all_sidecar_missing,
+        "require_all_sidecar_missing": bool(require_all_sidecar_missing),
+        "compatible": compatible,
+    }
 
 
 def parameter_counts(model) -> Dict[str, int]:
-    """Return total/trainable/CrossMamba parameter counts."""
+    named = list(model.named_parameters())
     return {
-        "total": sum(parameter.numel() for parameter in model.parameters()),
+        "total": sum(parameter.numel() for _, parameter in named),
         "trainable": sum(
-            parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+            parameter.numel() for _, parameter in named if parameter.requires_grad
         ),
-        "crossmamba": sum(
-            parameter.numel()
-            for name, parameter in model.named_parameters()
-            if name.startswith(CROSSMAMBA_PREFIX)
+        "local_anchor": sum(
+            parameter.numel() for name, parameter in named if name.startswith(LOCAL_PREFIX)
+        ),
+        "mamba_sidecar": sum(
+            parameter.numel() for name, parameter in named if name.startswith(SIDECAR_PREFIX)
         ),
     }
 
 
 def tensor_tree_signature(value) -> object:
-    """Describe nested model output structure without serializing tensor data."""
     if isinstance(value, torch.Tensor):
         return {
             "shape": list(value.shape),
@@ -104,11 +139,9 @@ def tensor_tree_signature(value) -> object:
 
 
 def floating_tensors(value) -> List[torch.Tensor]:
-    """Collect floating-point tensors from a nested model output."""
-    tensors: List[torch.Tensor] = []
-    if isinstance(value, torch.Tensor):
-        if value.is_floating_point():
-            tensors.append(value)
+    tensors = []  # type: List[torch.Tensor]
+    if isinstance(value, torch.Tensor) and value.is_floating_point():
+        tensors.append(value)
     elif isinstance(value, Mapping):
         for item in value.values():
             tensors.extend(floating_tensors(item))
@@ -119,19 +152,19 @@ def floating_tensors(value) -> List[torch.Tensor]:
 
 
 def output_surrogate_loss(outputs) -> torch.Tensor:
-    """Create a finite differentiable scalar from a nested model output."""
     tensors = [tensor for tensor in floating_tensors(outputs) if tensor.requires_grad]
     if not tensors:
         raise RuntimeError("model output contains no differentiable floating tensor")
     return sum(tensor.float().square().mean() for tensor in tensors)
 
 
-def gradients_report(model, prefix: str = CROSSMAMBA_PREFIX) -> Dict[str, object]:
-    """Report missing/non-finite gradients for trainable prefixed parameters."""
+def gradients_report(
+    model, prefixes: Sequence[str] = LABS_PREFIXES
+) -> Dict[str, object]:
     parameters = {
         name: parameter
         for name, parameter in model.named_parameters()
-        if name.startswith(prefix) and parameter.requires_grad
+        if name.startswith(tuple(prefixes)) and parameter.requires_grad
     }
     missing = sorted(name for name, parameter in parameters.items() if parameter.grad is None)
     non_finite = sorted(
@@ -154,7 +187,6 @@ def gradients_report(model, prefix: str = CROSSMAMBA_PREFIX) -> Dict[str, object
 
 
 def debug_state_to_json(state) -> object:
-    """Convert detached scalar/tiny debug tensors into JSON-compatible data."""
     if isinstance(state, torch.Tensor):
         value = state.detach().cpu()
         return float(value.item()) if value.numel() == 1 else value.tolist()
@@ -164,7 +196,6 @@ def debug_state_to_json(state) -> object:
 
 
 def write_json(path: str, payload: object) -> None:
-    """Write UTF-8 indented JSON and create the parent directory."""
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
@@ -174,6 +205,5 @@ def write_json(path: str, payload: object) -> None:
 
 
 def synchronize(device: torch.device) -> None:
-    """Synchronize only for CUDA devices."""
     if device.type == "cuda":
         torch.cuda.synchronize(device)

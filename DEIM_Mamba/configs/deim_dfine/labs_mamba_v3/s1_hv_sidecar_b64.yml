@@ -1,0 +1,52 @@
+# LABS-Mamba V3 / S1：local anchor + 最终 P4 的 HV-only、bottleneck=64 sidecar。
+# 必须从已收敛 S0 checkpoint 通过 -t 增量初始化；不得重新从 COCO 权重
+# 独立训练后与 S0 比较。训练前先运行 load_s0_for_sidecar.py 权重审计。
+__include__:
+  - ../deim_hgnetv2_l_wood.yml
+
+output_dir: ./deim_outputs/labs_mamba_v3_s1_hv_b64
+epoches: 50
+
+HybridEncoder:
+  use_local_anchor: true
+  use_mamba_sidecar: true
+  # HV = vertical(horizontal(reduced_final_P4))，只执行这一条顺序。
+  mamba_sidecar_path: hv
+  # final P4 在进入轴向 Mamba 前由 256 通道压缩到 64 通道。
+  mamba_sidecar_bottleneck_dim: 64
+  mamba_sidecar_d_state: 16
+  mamba_sidecar_d_conv: 4
+  mamba_sidecar_expand: 2
+  # beta = 0.05*tanh(beta_raw)，初始有效值 0.005，且始终有界。
+  mamba_sidecar_beta_init: 0.005
+  mamba_sidecar_beta_max: 0.05
+  # 默认去除候选残差的空间 DC 分量，并按样本做 detached RMS 对齐。
+  mamba_sidecar_center_residual: true
+  mamba_sidecar_rms_align: true
+  mamba_sidecar_max_align_scale: 10.0
+  mamba_sidecar_drop_path: 0.0
+  # 为按 epoch 写入 beta/RMS/P4 均值方差诊断而开启；模块默认值仍为 false。
+  mamba_sidecar_collect_debug: true
+  local_anchor_gamma_init: 0.001
+
+# 新 sidecar（含 beta_raw）使用原 encoder/default LR 的 1×：0.00025。
+# 排除 sidecar 后，原 backbone、encoder/decoder norm 分组的实际超参数不变。
+optimizer:
+  params:
+    - params: "^(?=.*backbone)(?!.*norm|bn).*$"
+      lr: 0.0000125
+    - params: "^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn))(?!.*mamba_sidecar_p4).*$"
+      weight_decay: 0.
+    - params: "^encoder\\.mamba_sidecar_p4\\..*$"
+      lr: 0.00025
+
+# 权重审计：
+# python tools/debug/load_s0_for_sidecar.py \
+#   --config configs/deim_dfine/labs_mamba_v3/s1_hv_sidecar_b64.yml \
+#   --checkpoint /home/zxw4090/hjw/DEIM_Mamba/deim_outputs/labs_mamba_v3_s0_local_anchor/best_stg2.pth
+
+# 双卡 warm-start 训练（-t 只加载模型权重，不恢复 S0 optimizer/epoch）：
+# CUDA_VISIBLE_DEVICES=0,2 torchrun --master_port=7791 --nproc_per_node=2 train.py \
+#   -c configs/deim_dfine/labs_mamba_v3/s1_hv_sidecar_b64.yml \
+#   -t /home/zxw4090/hjw/DEIM_Mamba/deim_outputs/labs_mamba_v3_s0_local_anchor/best_stg2.pth \
+#   --use-amp --seed=0

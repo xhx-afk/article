@@ -1,4 +1,4 @@
-"""统一评估 DEIM baseline 与 CrossMamba V2 R0～R4 checkpoint。
+"""统一评估 LABS-Mamba V3 S0～S5 checkpoint。
 
 每个启用的实验使用完全相同的 COCO 数据、阈值和推理参数，输出 COCO
 AP/AP50/AP75、逐类 AP/PR、TIDE、混淆矩阵、FP/FN、ECE/LaECE、IoU
@@ -38,7 +38,7 @@ CONFIG: Dict[str, Any] = {
     "ann_file": "/home/zxw4090/hjw/D-FINE/data/WoodDefect/wood_coco_all_only_defect_quick_balanced_4000/annotations/instances_test.json",
 
     # 每个实验会写入 output_root/<experiment name>/，根目录另有跨实验汇总。
-    "output_root": "./deim_outputs/crossmamba_v2_test_evaluation",
+    "output_root": "./deim_outputs/labs_mamba_v3_test_evaluation",
     "device": "cuda:0",
     "batch_size": 1,
     "num_workers": 4,
@@ -49,7 +49,7 @@ CONFIG: Dict[str, Any] = {
     "continue_on_error": True,
     "strict_checkpoint_structure": True,
     "save_query_records_csv": True,
-    # 所有检测指标必须使用相同阈值，才能公平比较 R0～R4。
+    # 所有检测指标必须使用相同阈值，才能公平比较 S0～S5。
     "confusion_score_threshold": 0.25,
     "confusion_iou_threshold": 0.50,
     "ece_score_threshold": 0.05,
@@ -67,34 +67,40 @@ CONFIG: Dict[str, Any] = {
     # config 与 checkpoint 必须来自同一个实验，严禁交叉加载。
     "experiments": [
         {
-            "name": "r0_baseline",
+            "name": "s0_local_anchor",
             "enabled": False,
-            "config": "./configs/deim_dfine/crossmamba_v2/r0_baseline.yml",
-            "checkpoint": "./deim_outputs/crossmamba_v2_r0_baseline/best_stg2.pth",
+            "config": "./configs/deim_dfine/labs_mamba_v3/s0_local_anchor.yml",
+            "checkpoint": "./deim_outputs/labs_mamba_v3_s0_local_anchor/best_stg2.pth",
         },
         {
-            "name": "r1_postfpn_local",
+            "name": "s1_hv_sidecar_b64",
             "enabled": False,
-            "config": "./configs/deim_dfine/crossmamba_v2/r1_postfpn_local.yml",
-            "checkpoint": "./deim_outputs/crossmamba_v2_r1_postfpn_local/best_stg2.pth",
+            "config": "./configs/deim_dfine/labs_mamba_v3/s1_hv_sidecar_b64.yml",
+            "checkpoint": "./deim_outputs/labs_mamba_v3_s1_hv_b64/best_stg2.pth",
         },
         {
-            "name": "r2_cross_hv_only",
+            "name": "s2_vh_sidecar_b64",
             "enabled": False,
-            "config": "./configs/deim_dfine/crossmamba_v2/r2_cross_hv_only.yml",
-            "checkpoint": "./deim_outputs/crossmamba_v2_r2_cross_hv_only/best_stg2.pth",
+            "config": "./configs/deim_dfine/labs_mamba_v3/s2_vh_sidecar_b64.yml",
+            "checkpoint": "./deim_outputs/labs_mamba_v3_s2_vh_b64/best_stg2.pth",
         },
         {
-            "name": "r3_cross_hv_vh_mean",
+            "name": "s3_hv_sidecar_b128",
             "enabled": False,
-            "config": "./configs/deim_dfine/crossmamba_v2/r3_cross_hv_vh_mean.yml",
-            "checkpoint": "./deim_outputs/crossmamba_v2_r3_cross_hv_vh_mean/best_stg2.pth",
+            "config": "./configs/deim_dfine/labs_mamba_v3/s3_hv_sidecar_b128.yml",
+            "checkpoint": "./deim_outputs/labs_mamba_v3_s3_hv_b128/best_stg2.pth",
         },
         {
-            "name": "r4_cross_hv_vh_gate",
+            "name": "s4_vh_sidecar_b128",
             "enabled": False,
-            "config": "./configs/deim_dfine/crossmamba_v2/r4_cross_hv_vh_gate.yml",
-            "checkpoint": "./deim_outputs/crossmamba_v2_r4_cross_hv_vh_gate/best_stg2.pth",
+            "config": "./configs/deim_dfine/labs_mamba_v3/s4_vh_sidecar_b128.yml",
+            "checkpoint": "./deim_outputs/labs_mamba_v3_s4_vh_b128/best_stg2.pth",
+        },
+        {
+            "name": "s5_best_path_center_ablation",
+            "enabled": False,
+            "config": "./configs/deim_dfine/labs_mamba_v3/s5_best_path_center_ablation.yml",
+            "checkpoint": "./deim_outputs/labs_mamba_v3_s5_best_no_center/best_stg2.pth",
         },
     ],
 }
@@ -141,6 +147,7 @@ REQUIRED_OUTPUTS: Tuple[str, ...] = (
     "predictions_bbox_summary.json",
     "predictions_bbox_summary.csv",
     "predictions_bbox_summary.png",
+    "raw_query_class_argmax_distribution.json",
     "evaluation_config.json",
 )
 
@@ -415,7 +422,7 @@ def _run_inference(
     config_path = _resolve(experiment["config"])
     checkpoint_path = _resolve(experiment["checkpoint"])
     signature = {
-        "cache_version": 3,
+        "cache_version": 4,
         "config": str(config_path),
         "config_mtime_ns": config_path.stat().st_mtime_ns if config_path.exists() else None,
         "config_tree_sha256": _config_tree_digest(),
@@ -448,10 +455,10 @@ def _run_inference(
     device = torch.device(device_name)
     model = cfg_obj.model
     missing, unexpected = model.load_state_dict(_checkpoint_state(checkpoint_path), strict=False)
-    allowed_missing = [
-        key for key in missing if key.startswith("encoder.crossmamba_p4.")
-    ]
-    illegal_missing = [key for key in missing if key not in allowed_missing]
+    # Evaluation requires a checkpoint from the exact selected experiment.
+    # Warm-start exceptions belong only to load_s0_for_sidecar.py, not testing.
+    allowed_missing: List[str] = []
+    illegal_missing = list(missing)
     if missing or unexpected:
         print(f"[LOAD] missing={len(missing)}, unexpected={len(unexpected)}")
         if cfg.get("strict_checkpoint_structure"):
@@ -477,6 +484,7 @@ def _run_inference(
     predictions: List[Dict[str, Any]] = []
     detections: List[Dict[str, Any]] = []
     query_records: List[Dict[str, Any]] = []
+    query_argmax_counts: Dict[int, int] = defaultdict(int)
     joint_target_power = float(getattr(criterion, "gamma", 1.0))
 
     for batch_index, (samples, targets) in enumerate(dataloader):
@@ -512,9 +520,12 @@ def _run_inference(
 
         quality_tensor = torch.sigmoid(outputs["pred_quality"].squeeze(-1)) if "pred_quality" in outputs else None
         if postprocessor.use_focal_loss:
-            class_confidence = torch.sigmoid(outputs["pred_logits"]).amax(-1)
+            class_scores = torch.sigmoid(outputs["pred_logits"])
         else:
-            class_confidence = torch.softmax(outputs["pred_logits"], dim=-1)[..., :-1].amax(-1)
+            class_scores = torch.softmax(outputs["pred_logits"], dim=-1)[..., :-1]
+        class_confidence, class_argmax = class_scores.max(-1)
+        for model_label in class_argmax.reshape(-1).tolist():
+            query_argmax_counts[int(model_label)] += 1
 
         for local_index, image_id in enumerate(image_ids):
             image = coco["images"][image_id]
@@ -552,7 +563,7 @@ def _run_inference(
                     box_cxcywh_to_xyxy(gt_boxes[gt_indices]),
                 ))
                 # DEIM MAL 的正 query 分类 target 是匹配 IoU 的 gamma 次幂。
-                # It is the current CrossMamba experiment's assignment joint target.
+                # It is the current LABS-Mamba experiment's assignment joint target.
                 target = pair_iou.clamp(min=0.0, max=1.0).pow(joint_target_power)
                 matched_iou[src_indices] = pair_iou
                 joint_target[src_indices] = target
@@ -565,6 +576,10 @@ def _run_inference(
                     "query_index": query_index,
                     "quality": float(quality_tensor[local_index, query_index].item()),
                     "class_confidence": float(class_confidence[local_index, query_index].item()),
+                    "class_argmax_model_label": int(class_argmax[local_index, query_index].item()),
+                    "class_argmax_category_id": label_to_cat.get(
+                        int(class_argmax[local_index, query_index].item())
+                    ),
                     "is_positive": int(positive[query_index].item()),
                     "matched_gt_id": matched_gt_ids[query_index],
                     "matched_iou": float(matched_iou[query_index].item()),
@@ -576,11 +591,31 @@ def _run_inference(
     for handle in quality_handles:
         handle.remove()
 
+    query_argmax_total = sum(query_argmax_counts.values())
+    query_argmax_distribution = {
+        "total_queries": query_argmax_total,
+        "rows": [
+            {
+                "model_label": model_label,
+                "category_id": label_to_cat.get(model_label),
+                "class_name": coco["id_to_name"].get(
+                    label_to_cat.get(model_label), "UNKNOWN_{}".format(model_label)
+                ),
+                "count": int(query_argmax_counts.get(model_label, 0)),
+                "share": (
+                    query_argmax_counts.get(model_label, 0) / query_argmax_total
+                    if query_argmax_total else None
+                ),
+            }
+            for model_label in sorted(label_to_cat)
+        ],
+    }
     result = {
         "cache_signature": signature,
         "predictions": predictions,
         "detections": detections,
         "query_records": query_records,
+        "raw_query_class_argmax_distribution": query_argmax_distribution,
         "quality_available": bool(query_records),
         "quality_source": (
             "sigmoid(final active D-FINE LQE reg_conf additive logit)"
@@ -592,13 +627,17 @@ def _run_inference(
         "joint_target_power": joint_target_power,
         "label_to_category_id": label_to_cat,
         "missing_keys": list(missing),
-        "allowed_crossmamba_missing_keys": allowed_missing,
+        "allowed_missing_keys": allowed_missing,
         "illegal_missing_keys": illegal_missing,
         "unexpected_keys": list(unexpected),
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(result, cache_path)
     _write_json(output_dir / "predictions.json", predictions)
+    _write_json(
+        output_dir / "raw_query_class_argmax_distribution.json",
+        query_argmax_distribution,
+    )
     if cfg.get("save_query_records_csv") and query_records:
         _write_csv(output_dir / "quality_query_records.csv", query_records)
     return result
@@ -1634,6 +1673,9 @@ def _write_all_metrics_summary(
         "per_class_background_FP": list(background_fp),
         "quality_diagnostics": quality,
         "prediction_bbox_statistics": list(bbox_summary),
+        "raw_query_class_argmax_distribution": inference.get(
+            "raw_query_class_argmax_distribution", {}
+        ),
     }
     _write_json(output_dir / "all_metrics_summary.json", payload)
     return payload
@@ -1647,7 +1689,7 @@ def _comparison_plot(rows: Sequence[Dict[str, Any]], output_root: Path) -> None:
     _table_image(
         output_root / "comparison_summary.png",
         rows,
-        "CrossMamba V2 R0-R4 unified evaluation",
+        "LABS-Mamba V3 S0-S5 unified evaluation",
         [
             "experiment", "AP", "AP50", "AP75", "Recall@0.50",
             "ECE", "LaECE", "background_FP",
@@ -1844,11 +1886,11 @@ def run(cfg: Dict[str, Any], selected_names: Optional[Sequence[str]] = None) -> 
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="统一评估 DEIM baseline 与 CrossMamba V2 R0～R4")
+    parser = argparse.ArgumentParser(description="统一评估 LABS-Mamba V3 S0～S5")
     parser.add_argument(
         "--experiments",
         default=None,
-        help="显式选择实验并覆盖 enabled 标志，逗号分隔，如 r0_baseline,r1_postfpn_local,r4_cross_hv_vh_gate",
+        help="显式选择实验并覆盖 enabled 标志，逗号分隔，如 s0_local_anchor,s1_hv_sidecar_b64,s2_vh_sidecar_b64",
     )
     parser.add_argument("--ann-file", default=None)
     parser.add_argument("--images-dir", default=None)

@@ -1,0 +1,31 @@
+# LABS-Mamba V3 / S0：仅保留已验证的 local anchor，不创建 Mamba 参数。
+#
+# 本文件继承 deim_hgnetv2_l_wood.yml 中的数据路径、9 类定义、960×960
+# 输入、增强、batch、matcher、criterion、decoder、postprocessor 和 optimizer。
+# S0/S1/S2 使用相同 50 epoch 快速筛选协议；正式全数据实验应统一改为
+# 75～100 epoch，并保持其余训练协议完全一致。
+__include__:
+  - ../deim_hgnetv2_l_wood.yml
+
+output_dir: ./deim_outputs/labs_mamba_v3_s0_local_anchor
+epoches: 50
+
+HybridEncoder:
+  # 第一次 P5→P4 top-down 融合后执行局部多核残差锚点。
+  use_local_anchor: true
+  # S0 不创建 mamba_sidecar_p4；未安装 mamba_ssm 也应可构建。
+  use_mamba_sidecar: false
+  # local anchor 的逐通道 LayerScale 初值。
+  local_anchor_gamma_init: 0.001
+
+# 双卡训练（在 /home/zxw4090/hjw/DEIM_Mamba 执行）：
+# CUDA_VISIBLE_DEVICES=0,2 torchrun --master_port=7790 --nproc_per_node=2 train.py \
+#   -c configs/deim_dfine/labs_mamba_v3/s0_local_anchor.yml \
+#   -t /home/zxw4090/hjw/D-FINE/weight/deim_dfine_hgnetv2_l_coco_50e.pth \
+#   --use-amp --seed=0
+
+# 从同结构 checkpoint 完整恢复中断训练（恢复 optimizer/epoch/EMA）：
+# CUDA_VISIBLE_DEVICES=0,2 torchrun --master_port=7790 --nproc_per_node=2 train.py \
+#   -c configs/deim_dfine/labs_mamba_v3/s0_local_anchor.yml \
+#   -r /home/zxw4090/hjw/DEIM_Mamba/deim_outputs/labs_mamba_v3_s0_local_anchor/last.pth \
+#   --use-amp --seed=0
