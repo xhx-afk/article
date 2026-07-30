@@ -1,0 +1,54 @@
+# =============================================================================
+# R0：原始 DEIM MAL 基线 + semantic mask 数据链
+# =============================================================================
+# 消融目的：
+#   1. 保持原 DEIM-L Wood 的模型、MAL、bbox/FGL/DDF、数据增强和训练周期不变；
+#   2. 只让 train/val dataset 返回 masks 与 mask_valid；
+#   3. 作为 R1～R4 的唯一公平对照组。
+#
+# R0 不创建 localization-quality head，不创建 defectness head，不计算 query
+# semantic evidence，也不进行质量重排序或背景 ranking。
+#
+# __include__ 会先加载九类 Wood 的完整 DEIM-L 配置。本文件中的同名字段仅做覆盖；
+# 未写出的 image size=960、batch size、optimizer、epoches、增强等全部继承父配置。
+__include__: ["../deim_hgnetv2_l_wood.yml"]
+
+# 默认输出目录。命令行 --output-dir 的优先级更高，推荐实际实验使用
+# output_2/sqalign_v2/r0_baseline，避免与历史输出混放。
+output_dir: ./output/sqalign/r0_baseline
+
+train_dataloader:
+  dataset:
+    # true：ConvertCocoPolysToMask 同时返回：
+    #   masks      [N,H,W]，每个 bbox 对应的实例二值 mask；
+    #   mask_valid [N]，标记该实例的 semantic mask 是否可信。
+    # R0 不使用 mask 计算 loss，但仍开启它，以保证 R0～R4 经过完全相同的数据链。
+    # 训练 annotation JSON 必须包含 segmentation/mask_valid；否则 mask 会为空。
+    return_masks: true
+
+val_dataloader:
+  dataset:
+    # 验证阶段同样读取 masks，供 defectness 指标和可视化使用。
+    # 普通 COCO bbox AP 不会因为 return_masks=true 改变评估定义。
+    return_masks: true
+
+# --------------------------- 推荐训练命令 ---------------------------
+# 远程 Linux 服务器先执行：
+#   conda activate yolov11
+#
+# 双卡训练（GPU 0、2）：
+#   mkdir -p output_2/sqalign_v2/r0_baseline
+#   CUDA_VISIBLE_DEVICES=0,2 torchrun --master_port=7830 --nproc_per_node=2 \
+#     train.py -c configs/deim_dfine/ablation_sqalign/r0_baseline.yml \
+#     --use-amp --seed=0 \
+#     -t ./weight/deim_dfine_hgnetv2_l_coco_50e.pth \
+#     --output-dir output_2/sqalign_v2/r0_baseline \
+#     2>&1 | tee output_2/sqalign_v2/r0_baseline/train_console.log
+#
+# 单卡训练（仅用于调试或显存检查）：
+#   mkdir -p output_2/sqalign_v2/debug_r0
+#   CUDA_VISIBLE_DEVICES=0 python train.py \
+#     -c configs/deim_dfine/ablation_sqalign/r0_baseline.yml \
+#     --use-amp --seed=0 \
+#     -t ./weight/deim_dfine_hgnetv2_l_coco_50e.pth \
+#     --output-dir output_2/sqalign_v2/debug_r0

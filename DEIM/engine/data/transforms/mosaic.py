@@ -88,44 +88,60 @@ class Mosaic(T.Transform):
         return mosaic_samples, max_height, max_width
 
     def create_mosaic_from_cache(self, mosaic_samples, max_height, max_width):
-        placement_offsets = [[0, 0], [max_width, 0], [0, max_height], [max_width, max_height]]
+        placement_offsets = ((0, 0), (max_width, 0), (0, max_height), (max_width, max_height))
         merged_image = Image.new(mode=mosaic_samples[0]["img"].mode, size=(max_width * 2, max_height * 2), color=0)
-        offsets = torch.tensor([[0, 0], [max_width, 0], [0, max_height], [max_width, max_height]]).repeat(1, 2)
-
-        mosaic_target = []
         for i, sample in enumerate(mosaic_samples):
-            img = sample["img"]
-            target = sample["labels"]
+            merged_image.paste(sample["img"], placement_offsets[i])
 
-            merged_image.paste(img, placement_offsets[i])
-            target['boxes'] = target['boxes'] + offsets[i]
-            mosaic_target.append(target)
-
-        merged_target = {}
-        for key in mosaic_target[0]:
-            merged_target[key] = torch.cat([target[key] for target in mosaic_target])
-
+        targets = [sample["labels"] for sample in mosaic_samples]
+        merged_target = self._merge_targets(targets, placement_offsets, max_height, max_width)
         return merged_image, merged_target
 
     def create_mosaic_from_dataset(self, images, targets, max_height, max_width):
         """Creates a mosaic image by combining multiple images."""
-        placement_offsets = [[0, 0], [max_width, 0], [0, max_height], [max_width, max_height]]
+        placement_offsets = ((0, 0), (max_width, 0), (0, max_height), (max_width, max_height))
         merged_image = Image.new(mode=images[0].mode, size=(max_width * 2, max_height * 2), color=0)
         for i, img in enumerate(images):
             merged_image.paste(img, placement_offsets[i])
 
-        """Merges targets into a single target dictionary for the mosaic."""
-        offsets = torch.tensor([[0, 0], [max_width, 0], [0, max_height], [max_width, max_height]]).repeat(1, 2)
+        merged_target = self._merge_targets(targets, placement_offsets, max_height, max_width)
+        return merged_image, merged_target
+
+    @staticmethod
+    def _merge_targets(targets, placement_offsets, max_height, max_width):
+        """Merge instance fields and place every source mask on the full 2x2 canvas."""
+        canvas_height, canvas_width = max_height * 2, max_width * 2
         merged_target = {}
         for key in targets[0]:
             if key == 'boxes':
-                values = [target[key] + offsets[i] for i, target in enumerate(targets)]
+                values = []
+                for target, (offset_x, offset_y) in zip(targets, placement_offsets):
+                    offset = target[key].new_tensor([offset_x, offset_y, offset_x, offset_y])
+                    values.append(target[key] + offset)
+            elif key == 'masks':
+                values = []
+                for target, (offset_x, offset_y) in zip(targets, placement_offsets):
+                    masks = target[key]
+                    if masks.ndim != 3:
+                        raise ValueError(f"Mosaic masks 必须是 [N,H,W]，实际为 {tuple(masks.shape)}")
+                    mask_height, mask_width = int(masks.shape[-2]), int(masks.shape[-1])
+                    if mask_height > max_height or mask_width > max_width:
+                        raise ValueError(
+                            f"Mosaic 单图 mask 尺寸 {(mask_height, mask_width)} 超出 tile "
+                            f"尺寸 {(max_height, max_width)}"
+                        )
+                    placed = masks.new_zeros((masks.shape[0], canvas_height, canvas_width))
+                    placed[
+                        :,
+                        offset_y:offset_y + mask_height,
+                        offset_x:offset_x + mask_width,
+                    ] = masks
+                    values.append(placed)
             else:
                 values = [target[key] for target in targets]
 
             merged_target[key] = torch.cat(values, dim=0) if isinstance(values[0], torch.Tensor) else values
-
-        return merged_image, merged_target
+        return merged_target
 
     @staticmethod
     def _clone(tensor_dict):
@@ -161,6 +177,17 @@ class Mosaic(T.Transform):
                                                           spatial_size=mosaic_image.size[::-1])
         if 'masks' in mosaic_target:
             mosaic_target['masks'] = convert_to_tv_tensor(mosaic_target['masks'], 'masks')
+            expected_size = mosaic_image.size[::-1]
+            actual_size = tuple(mosaic_target['masks'].shape[-2:])
+            if actual_size != expected_size:
+                raise ValueError(
+                    f"Mosaic image/mask 尺寸不一致：image={expected_size}, masks={actual_size}"
+                )
+            if 'boxes' in mosaic_target and mosaic_target['masks'].shape[0] != mosaic_target['boxes'].shape[0]:
+                raise ValueError(
+                    "Mosaic boxes/masks 实例数不一致："
+                    f"boxes={mosaic_target['boxes'].shape[0]}, masks={mosaic_target['masks'].shape[0]}"
+                )
 
         # Apply affine transformations
         mosaic_image, mosaic_target = self.affine_transform(mosaic_image, mosaic_target)

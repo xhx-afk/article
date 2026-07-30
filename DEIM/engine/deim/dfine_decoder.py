@@ -21,7 +21,7 @@ from .dfine_utils import weighting_function, distance2bbox
 from .denoising import get_contrastive_denoising_training_group
 from .utils import deformable_attention_core_func_v2, get_activation, inverse_sigmoid
 from .utils import bias_init_with_prob
-from .sqmal import QueryQualityHead
+from .semantic_query_alignment import QueryLocalizationQualityHead
 from ..core import register
 
 __all__ = ['DFINETransformer']
@@ -332,7 +332,7 @@ class TransformerDecoder(nn.Module):
                 spatial_shapes,
                 bbox_head,
                 score_head,
-                quality_head,
+                loc_quality_head,
                 query_pos_head,
                 pre_bbox_head,
                 integral,
@@ -349,7 +349,7 @@ class TransformerDecoder(nn.Module):
         dec_out_logits = []
         dec_out_pred_corners = []
         dec_out_refs = []
-        dec_out_quality = []
+        dec_out_loc_quality = []
         if not hasattr(self, 'project'):
             project = weighting_function(self.reg_max, up, reg_scale)
         else:
@@ -388,8 +388,8 @@ class TransformerDecoder(nn.Module):
                 dec_out_bboxes.append(inter_ref_bbox)
                 dec_out_pred_corners.append(pred_corners)
                 dec_out_refs.append(ref_points_initial)
-                if quality_head is not None:
-                    dec_out_quality.append(quality_head[i](output))
+                if loc_quality_head is not None:
+                    dec_out_loc_quality.append(loc_quality_head[i](output))
 
                 if not self.training:
                     break
@@ -398,9 +398,9 @@ class TransformerDecoder(nn.Module):
             ref_points_detach = inter_ref_bbox.detach()
             output_detach = output.detach()
 
-        quality = torch.stack(dec_out_quality) if dec_out_quality else None
+        loc_quality = torch.stack(dec_out_loc_quality) if dec_out_loc_quality else None
         return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), \
-               torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), pre_bboxes, pre_scores, quality
+               torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), pre_bboxes, pre_scores, loc_quality
 
 
 @register()
@@ -434,9 +434,9 @@ class DFINETransformer(nn.Module):
                  reg_scale=4.,
                  layer_scale=1,
                  mlp_act='relu',
-                 use_quality_head=False,
-                 quality_hidden_dim=128,
-                 quality_aux_last_n=0,
+                 use_loc_quality_head=False,
+                 loc_quality_hidden_dim=128,
+                 loc_quality_aux_last_n=0,
                  ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -457,8 +457,8 @@ class DFINETransformer(nn.Module):
         self.eval_spatial_size = eval_spatial_size
         self.aux_loss = aux_loss
         self.reg_max = reg_max
-        self.use_quality_head = bool(use_quality_head)
-        self.quality_aux_last_n = max(0, int(quality_aux_last_n))
+        self.use_loc_quality_head = bool(use_loc_quality_head)
+        self.loc_quality_aux_last_n = max(0, int(loc_quality_aux_last_n))
 
         assert query_select_method in ('default', 'one2many', 'agnostic'), ''
         assert cross_attn_method in ('default', 'discrete'), ''
@@ -517,10 +517,10 @@ class DFINETransformer(nn.Module):
             [MLP(hidden_dim, hidden_dim, 4 * (self.reg_max+1), 3, act=mlp_act) for _ in range(self.eval_idx + 1)]
           + [MLP(scaled_dim, scaled_dim, 4 * (self.reg_max+1), 3, act=mlp_act) for _ in range(num_layers - self.eval_idx - 1)])
         self.integral = Integral(self.reg_max)
-        self.dec_quality_head = nn.ModuleList(
-            [QueryQualityHead(hidden_dim, quality_hidden_dim) for _ in range(self.eval_idx + 1)]
-            + [QueryQualityHead(scaled_dim, quality_hidden_dim) for _ in range(num_layers - self.eval_idx - 1)]
-        ) if self.use_quality_head else None
+        self.dec_loc_quality_head = nn.ModuleList(
+            [QueryLocalizationQualityHead(hidden_dim, loc_quality_hidden_dim) for _ in range(self.eval_idx + 1)]
+            + [QueryLocalizationQualityHead(scaled_dim, loc_quality_hidden_dim) for _ in range(num_layers - self.eval_idx - 1)]
+        ) if self.use_loc_quality_head else None
 
         # init encoder output anchors and valid_mask
         if self.eval_spatial_size:
@@ -539,9 +539,9 @@ class DFINETransformer(nn.Module):
         self.dec_bbox_head = nn.ModuleList(
             [self.dec_bbox_head[i] if i <= self.eval_idx else nn.Identity() for i in range(len(self.dec_bbox_head))]
         )
-        if self.dec_quality_head is not None:
-            self.dec_quality_head = nn.ModuleList(
-                [nn.Identity()] * self.eval_idx + [self.dec_quality_head[self.eval_idx]]
+        if self.dec_loc_quality_head is not None:
+            self.dec_loc_quality_head = nn.ModuleList(
+                [nn.Identity()] * self.eval_idx + [self.dec_loc_quality_head[self.eval_idx]]
             )
 
     def _reset_parameters(self, feat_channels):
@@ -743,14 +743,14 @@ class DFINETransformer(nn.Module):
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
         # decoder
-        out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits, out_quality = self.decoder(
+        out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits, out_loc_quality = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
             memory,
             spatial_shapes,
             self.dec_bbox_head,
             self.dec_score_head,
-            self.dec_quality_head,
+            self.dec_loc_quality_head,
             self.query_pos_head,
             self.pre_bbox_head,
             self.integral,
@@ -769,8 +769,8 @@ class DFINETransformer(nn.Module):
 
             dn_out_corners, out_corners = torch.split(out_corners, dn_meta['dn_num_split'], dim=2)
             dn_out_refs, out_refs = torch.split(out_refs, dn_meta['dn_num_split'], dim=2)
-            if out_quality is not None:
-                _, out_quality = torch.split(out_quality, dn_meta['dn_num_split'], dim=2)
+            if out_loc_quality is not None:
+                _, out_loc_quality = torch.split(out_loc_quality, dn_meta['dn_num_split'], dim=2)
 
 
         if self.training:
@@ -778,16 +778,16 @@ class DFINETransformer(nn.Module):
                    'ref_points': out_refs[-1], 'up': self.up, 'reg_scale': self.reg_scale}
         else:
             out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
-        if out_quality is not None:
-            out['pred_quality'] = out_quality[-1]
+        if out_loc_quality is not None:
+            out['pred_loc_quality'] = out_loc_quality[-1]
 
         if self.training and self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss2(out_logits[:-1], out_bboxes[:-1], out_corners[:-1], out_refs[:-1],
                                                      out_corners[-1], out_logits[-1])
-            if out_quality is not None and self.quality_aux_last_n > 0:
-                first_quality_aux = max(0, len(out['aux_outputs']) - self.quality_aux_last_n)
-                for aux_index in range(first_quality_aux, len(out['aux_outputs'])):
-                    out['aux_outputs'][aux_index]['pred_quality'] = out_quality[aux_index]
+            if out_loc_quality is not None and self.loc_quality_aux_last_n > 0:
+                first_loc_quality_aux = max(0, len(out['aux_outputs']) - self.loc_quality_aux_last_n)
+                for aux_index in range(first_loc_quality_aux, len(out['aux_outputs'])):
+                    out['aux_outputs'][aux_index]['pred_loc_quality'] = out_loc_quality[aux_index]
             out['enc_aux_outputs'] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list)
             out['pre_outputs'] = {'pred_logits': pre_logits, 'pred_boxes': pre_bboxes}
             out['enc_meta'] = {'class_agnostic': self.query_select_method == 'agnostic'}

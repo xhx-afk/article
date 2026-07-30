@@ -1,0 +1,60 @@
+# =============================================================================
+# R2：R1 + Binary Defectness Pixel Auxiliary
+# =============================================================================
+# 在 encoder 的最高分辨率特征 features[0] 上预测二值 defectness map，使用有效实例
+# masks 的并集进行 BCEWithLogits + Dice 监督。本阶段 defect map 只是像素辅助任务：
+# 不生成 pred_sem_quality，也不参与推理排序，以便单独测量 pixel auxiliary 的增益。
+__include__: ["./r1_all_query_loc.yml"]
+
+# 默认输出目录；通常由训练命令覆盖。
+output_dir: ./output/sqalign/r2_loc_defect_aux
+
+DEIM:
+  # true：创建 DefectnessHead，并在训练态输出 pred_defect_logits [B,1,Hd,Wd]。
+  use_defectness_head: true
+  # DefectnessHead 输入通道，必须与 HybridEncoder 的 features[0] 通道数一致。
+  # 当前 DEIM-L Wood encoder 的输出通道为 256。
+  defectness_in_channels: 256
+  # 轻量 defectness head 的内部通道数；影响 head 容量和少量显存/计算量。
+  defectness_hidden_channels: 128
+  # false：R2 不从 defect map 对 predicted boxes 做 ROI pooling；因此没有
+  # pred_sem_quality 和 query-semantic loss，semantic quality 也不参与 top-k。
+  use_query_semantic: false
+  # false：普通 eval/inference 不把完整 heatmap 放入模型返回字典，节省显存和传输。
+  # 训练态仍会返回 heatmap 计算 loss；可视化脚本会临时打开该开关。
+  return_defect_map_in_eval: false
+
+DEIMCriterion:
+  # 在继承的 MAL/boxes/local/loc_quality 基础上增加 defect 像素损失。
+  losses: ["mal", "boxes", "local", "loc_quality", "defect"]
+  # defect loss 内部逐像素 BCEWithLogits 项的系数。
+  defect_bce_weight: 1.0
+  # defect loss 内部 Dice 项的系数，用于缓解缺陷像素稀疏和前景/背景不平衡。
+  defect_dice_weight: 1.0
+  weight_dict:
+    # 合并后的 loss_defect 在总 loss 中的外层系数。
+    loss_defect: 0.5
+
+# PostProcessor 完整继承 R1：只启用 loc quality rerank；semantic rerank 仍为 false。
+
+# --------------------------- 重点观察 ---------------------------
+# loss_defect、metric_defect_dice、metric_defect_pixel_precision、
+# metric_defect_pixel_recall、metric_valid_mask_ratio。若 valid ratio 接近 0，
+# 应优先检查 annotation JSON 的 segmentation/mask_valid 与增强后的 mask 对齐。
+
+# --------------------------- 推荐训练命令 ---------------------------
+#   conda activate yolov11
+#   mkdir -p output_2/sqalign_v2/r2_loc_defect_aux
+#   CUDA_VISIBLE_DEVICES=0,2 torchrun --master_port=7832 --nproc_per_node=2 \
+#     train.py -c configs/deim_dfine/ablation_sqalign/r2_loc_defect_aux.yml \
+#     --use-amp --seed=0 \
+#     -t ./weight/deim_dfine_hgnetv2_l_coco_50e.pth \
+#     --output-dir output_2/sqalign_v2/r2_loc_defect_aux \
+#     2>&1 | tee output_2/sqalign_v2/r2_loc_defect_aux/train_console.log
+#
+# 单卡调试：
+#   mkdir -p output_2/sqalign_v2/debug_r2
+#   CUDA_VISIBLE_DEVICES=0 python train.py \
+#     -c configs/deim_dfine/ablation_sqalign/r2_loc_defect_aux.yml \
+#     --use-amp --seed=0 -t ./weight/deim_dfine_hgnetv2_l_coco_50e.pth \
+#     --output-dir output_2/sqalign_v2/debug_r2

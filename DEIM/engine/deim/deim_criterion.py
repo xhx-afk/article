@@ -16,12 +16,13 @@ import copy
 
 from .dfine_utils import bbox2distance
 from .box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
-from .sqmal import (
+from .semantic_query_alignment import (
+    build_all_query_best_iou_target,
+    build_query_semantic_supervision,
     build_union_defect_target,
-    compute_semantic_support,
-    compute_sq_quality_target,
-    select_hard_background_queries,
-    semantic_beta_schedule,
+    compose_dual_quality_scores,
+    final_score_ranking_loss,
+    select_final_score_background,
 )
 from ..misc.dist_utils import get_world_size, is_dist_available_and_initialized
 from ..core import register
@@ -46,19 +47,23 @@ class DEIMCriterion(nn.Module):
         share_matched_indices=False,
         mal_alpha=None,
         use_uni_set=True,
-        use_sqmal=False,
-        semantic_beta=0.5,
-        semantic_warmup_epochs=0,
-        semantic_min_mask_area=2.0,
-        sqmal_aux_loss=False,
-        quality_pos_weight=1.0,
-        quality_neg_weight=0.25,
+        loc_near_iou_threshold=0.10,
+        loc_near_weight=1.0,
+        loc_far_weight=0.10,
+        loc_matched_extra_weight=1.0,
         defect_bce_weight=1.0,
         defect_dice_weight=1.0,
-        use_hard_bg=False,
-        hard_bg_topk=20,
-        hard_bg_iou_threshold=0.1,
-        hard_bg_start_epoch=0,
+        semantic_query_pos_weight=1.0,
+        semantic_query_bg_weight=0.25,
+        semantic_query_bg_iou_threshold=0.10,
+        use_final_bg_rank=False,
+        final_bg_topk=5,
+        final_bg_iou_threshold=0.10,
+        final_bg_start_epoch=10,
+        final_bg_margin=0.05,
+        final_bg_temperature=0.10,
+        loc_quality_power=0.25,
+        semantic_quality_power=0.25,
         ):
         """Create the criterion.
         Parameters:
@@ -84,134 +89,97 @@ class DEIMCriterion(nn.Module):
         self.num_pos, self.num_neg = None, None
         self.mal_alpha = mal_alpha
         self.use_uni_set = use_uni_set
-        self.use_sqmal = bool(use_sqmal)
-        self.semantic_beta = float(semantic_beta)
-        self.semantic_warmup_epochs = int(semantic_warmup_epochs)
-        self.semantic_min_mask_area = float(semantic_min_mask_area)
-        self.sqmal_aux_loss = bool(sqmal_aux_loss)
-        self.quality_pos_weight = float(quality_pos_weight)
-        self.quality_neg_weight = float(quality_neg_weight)
+        self.loc_near_iou_threshold = float(loc_near_iou_threshold)
+        self.loc_near_weight = float(loc_near_weight)
+        self.loc_far_weight = float(loc_far_weight)
+        self.loc_matched_extra_weight = float(loc_matched_extra_weight)
         self.defect_bce_weight = float(defect_bce_weight)
         self.defect_dice_weight = float(defect_dice_weight)
-        self.use_hard_bg = bool(use_hard_bg)
-        self.hard_bg_topk = int(hard_bg_topk)
-        self.hard_bg_iou_threshold = float(hard_bg_iou_threshold)
-        self.hard_bg_start_epoch = int(hard_bg_start_epoch)
+        self.semantic_query_pos_weight = float(semantic_query_pos_weight)
+        self.semantic_query_bg_weight = float(semantic_query_bg_weight)
+        self.semantic_query_bg_iou_threshold = float(semantic_query_bg_iou_threshold)
+        self.use_final_bg_rank = bool(use_final_bg_rank)
+        self.final_bg_topk = int(final_bg_topk)
+        self.final_bg_iou_threshold = float(final_bg_iou_threshold)
+        self.final_bg_start_epoch = int(final_bg_start_epoch)
+        self.final_bg_margin = float(final_bg_margin)
+        self.final_bg_temperature = float(final_bg_temperature)
+        self.loc_quality_power = float(loc_quality_power)
+        self.semantic_quality_power = float(semantic_quality_power)
         self.current_epoch = 0
         self.total_epochs = None
-        self._sq_cache = {}
+        self._alignment_cache = {}
         self._diagnostics = {}
 
     def set_epoch(self, epoch: int, total_epochs=None):
         self.current_epoch = int(epoch)
         self.total_epochs = None if total_epochs is None else int(total_epochs)
 
-    def _current_beta(self) -> float:
-        return semantic_beta_schedule(self.semantic_beta, self.semantic_warmup_epochs, self.current_epoch)
-
     def _branch_losses(self, branch: str, branch_outputs):
-        result = []
-        for loss in self.losses:
-            mapped = loss
-            if loss == 'sqmal' and branch != 'main':
-                mapped = 'sqmal' if branch == 'aux' and self.sqmal_aux_loss else 'mal'
-            elif loss in ('quality', 'defect', 'hard_bg') and branch != 'main':
-                if not (loss == 'quality' and branch == 'aux' and 'pred_quality' in branch_outputs):
-                    continue
-            if mapped not in result:
-                result.append(mapped)
-        return result
+        main_only = {'loc_quality', 'defect', 'query_semantic', 'final_bg_rank'}
+        return [loss for loss in self.losses if branch == 'main' or loss not in main_only]
 
-    def _matched_quality_components(self, outputs, targets, indices):
+    def _best_iou_target(self, outputs, targets):
         cache_key = int(outputs['pred_boxes'].data_ptr())
-        if cache_key in self._sq_cache:
-            return self._sq_cache[cache_key]
-        idx = self._get_src_permutation_idx(indices)
-        src_boxes = outputs['pred_boxes'][idx]
-        if src_boxes.shape[0] == 0:
-            empty = outputs['pred_boxes'].new_zeros((0,), dtype=torch.float32)
-            components = (idx, empty, empty, self._current_beta())
-            self._sq_cache[cache_key] = components
-            return components
-        target_boxes = torch.cat([target['boxes'][target_idx] for target, (_, target_idx) in zip(targets, indices)], dim=0)
-        ious = torch.diag(box_iou(
-            box_cxcywh_to_xyxy(src_boxes.detach()), box_cxcywh_to_xyxy(target_boxes)
-        )[0]).detach().clamp(0.0, 1.0)
-        support_parts = []
-        for batch_index, (target, (src_idx, target_idx)) in enumerate(zip(targets, indices)):
-            if src_idx.numel() == 0:
-                continue
-            masks = target.get('masks')
-            valid = target.get('mask_valid')
-            if masks is None or valid is None:
-                support_parts.append(src_boxes.new_ones((src_idx.numel(),), dtype=torch.float32))
-                continue
-            support_parts.append(compute_semantic_support(
-                outputs['pred_boxes'][batch_index, src_idx],
-                target['boxes'][target_idx],
-                masks[target_idx],
-                valid[target_idx],
-                min_mask_area=self.semantic_min_mask_area,
-            ))
-        support = torch.cat(support_parts, dim=0) if support_parts else ious.new_ones(ious.shape)
-        beta = self._current_beta()
-        components = (idx, ious, support, beta)
-        self._sq_cache[cache_key] = components
-        return components
+        if cache_key not in self._alignment_cache:
+            self._alignment_cache[cache_key] = build_all_query_best_iou_target(outputs['pred_boxes'], targets)
+        return self._alignment_cache[cache_key]
 
-    def loss_labels_sqmal(self, outputs, targets, indices, num_boxes):
-        if not self.use_sqmal:
-            return self.loss_labels_mal(outputs, targets, indices, num_boxes)
-        idx, ious, support, beta = self._matched_quality_components(outputs, targets, indices)
-        src_logits = outputs['pred_logits']
-        target_classes_o = torch.cat([target['labels'][j] for target, (_, j) in zip(targets, indices)])
-        target_classes = torch.full(src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device)
-        target_classes[idx] = target_classes_o
-        one_hot = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1]
-        matched_target = compute_sq_quality_target(ious, support, beta, iou_power=self.gamma)
-        target_score_o = torch.zeros_like(target_classes, dtype=src_logits.dtype)
-        target_score_o[idx] = matched_target.to(src_logits.dtype)
-        target_score = target_score_o.unsqueeze(-1) * one_hot
-        pred_score = src_logits.sigmoid().detach()
-        weight = pred_score.pow(self.gamma) * (1 - one_hot) + one_hot
-        if self.mal_alpha is not None:
-            weight = self.mal_alpha * pred_score.pow(self.gamma) * (1 - one_hot) + one_hot
-        loss = F.binary_cross_entropy_with_logits(src_logits, target_score, weight=weight, reduction='none')
-        loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
-        self._diagnostics.update({
-            'metric_semantic_beta_current': src_logits.new_tensor(beta),
-            'metric_mean_matched_iou': ious.mean() if ious.numel() else src_logits.sum() * 0.0,
-            'metric_mean_semantic_support': support.mean() if support.numel() else src_logits.sum() * 0.0,
-            'metric_mean_quality_target': matched_target.mean() if matched_target.numel() else src_logits.sum() * 0.0,
-        })
-        return {'loss_sqmal': loss}
+    @staticmethod
+    def _masked_mean(values, mask, zero):
+        return values[mask].mean() if mask.any() else zero
 
-    def loss_quality(self, outputs, targets, indices, num_boxes):
-        if 'pred_quality' not in outputs:
-            return {'loss_quality': outputs['pred_logits'].sum() * 0.0}
-        idx, ious, support, beta = self._matched_quality_components(outputs, targets, indices)
-        logits = outputs['pred_quality'].squeeze(-1)
-        target_quality = torch.zeros_like(logits)
-        matched_target = compute_sq_quality_target(ious, support, beta, iou_power=1.0)
-        target_quality[idx] = matched_target.to(logits.dtype)
-        pos_mask = torch.zeros_like(logits, dtype=torch.bool)
-        pos_mask[idx] = True
-        neg_mask = ~pos_mask
-        bce = F.binary_cross_entropy_with_logits(logits, target_quality, reduction='none')
+    @staticmethod
+    def _batch_spearman(predictions, targets):
+        correlations = []
+        for prediction, target in zip(predictions.detach().float(), targets.detach().float()):
+            if prediction.numel() < 2 or prediction.std(unbiased=False) == 0 or target.std(unbiased=False) == 0:
+                continue
+            pred_rank = prediction.argsort().argsort().float()
+            target_rank = target.argsort().argsort().float()
+            pred_rank = pred_rank - pred_rank.mean()
+            target_rank = target_rank - target_rank.mean()
+            denominator = pred_rank.square().sum().sqrt() * target_rank.square().sum().sqrt()
+            correlations.append((pred_rank * target_rank).sum() / denominator.clamp_min(1e-12))
+        if correlations:
+            return torch.stack(correlations).mean().to(predictions.device)
+        return predictions.sum() * 0.0
+
+    def loss_loc_quality(self, outputs, targets, indices, num_boxes):
+        logits_tensor = outputs.get('pred_loc_quality')
+        if logits_tensor is None:
+            return {'loss_loc_quality': outputs['pred_logits'].sum() * 0.0}
+        logits = logits_tensor.squeeze(-1)
+        best_iou = self._best_iou_target(outputs, targets).to(logits.device)
+        near_mask = best_iou >= self.loc_near_iou_threshold
+        far_mask = ~near_mask
+        matched_mask = torch.zeros_like(near_mask)
+        for batch_index, (source_indices, _) in enumerate(indices):
+            matched_mask[batch_index, source_indices] = True
+
+        bce = F.binary_cross_entropy_with_logits(logits.float(), best_iou.float(), reduction='none')
         zero = logits.sum() * 0.0
-        pos_loss = bce[pos_mask].mean() if pos_mask.any() else zero
-        neg_loss = bce[neg_mask].mean() if neg_mask.any() else zero
-        loss = self.quality_pos_weight * pos_loss + self.quality_neg_weight * neg_loss
-        predictions = logits.sigmoid()
+        near_loss = self._masked_mean(bce, near_mask, zero)
+        far_loss = self._masked_mean(bce, far_mask, zero)
+        matched_loss = self._masked_mean(bce, matched_mask, zero)
+        loss = (
+            self.loc_near_weight * near_loss
+            + self.loc_far_weight * far_loss
+            + self.loc_matched_extra_weight * matched_loss
+        )
+
+        prediction = logits.sigmoid()
         self._diagnostics.update({
-            'metric_semantic_beta_current': logits.new_tensor(beta),
-            'metric_mean_matched_iou': ious.mean() if ious.numel() else zero,
-            'metric_mean_semantic_support': support.mean() if support.numel() else zero,
-            'metric_mean_quality_target': matched_target.mean() if matched_target.numel() else zero,
-            'metric_mean_quality_pred_pos': predictions[pos_mask].mean() if pos_mask.any() else zero,
-            'metric_mean_quality_pred_neg': predictions[neg_mask].mean() if neg_mask.any() else zero,
+            'metric_best_iou_mean': best_iou.mean() if best_iou.numel() else zero,
+            'metric_locq_target_mean': best_iou.mean() if best_iou.numel() else zero,
+            'metric_locq_pred_mean': prediction.mean() if prediction.numel() else zero,
+            'metric_locq_pred_near': self._masked_mean(prediction, near_mask, zero),
+            'metric_locq_pred_far': self._masked_mean(prediction, far_mask, zero),
+            'metric_locq_pred_matched': self._masked_mean(prediction, matched_mask, zero),
+            'metric_locq_best_iou_spearman_batch': self._batch_spearman(prediction, best_iou),
+            'metric_locq_target_ge_05_ratio': (best_iou >= 0.5).float().mean() if best_iou.numel() else zero,
         })
-        return {'loss_quality': loss}
+        return {'loss_loc_quality': loss}
 
     def loss_defect(self, outputs, targets, indices, num_boxes):
         logits = outputs.get('pred_defect_logits')
@@ -224,27 +192,116 @@ class DEIMCriterion(nn.Module):
         intersection = (probability * target_float).flatten(1).sum(-1)
         denominator = probability.flatten(1).sum(-1) + target_float.flatten(1).sum(-1)
         dice = (1.0 - (2.0 * intersection + 1.0) / (denominator + 1.0)).mean()
+        prediction_binary = probability >= 0.5
+        target_binary = target_float >= 0.5
+        true_positive = (prediction_binary & target_binary).sum().float()
+        predicted_positive = prediction_binary.sum().float()
+        target_positive = target_binary.sum().float()
         valid_count = sum(int(target_item.get('mask_valid', torch.empty(0)).numel()) for target_item in targets)
         valid_sum = sum(target_item.get('mask_valid', torch.empty(0, device=logits.device)).float().sum() for target_item in targets)
-        self._diagnostics['metric_valid_mask_ratio_in_batch'] = (
-            valid_sum / max(valid_count, 1) if valid_count else logits.sum() * 0.0
-        )
+        zero = logits.sum() * 0.0
+        self._diagnostics.update({
+            'metric_valid_mask_ratio': valid_sum / max(valid_count, 1) if valid_count else zero,
+            'metric_defect_dice': 1.0 - dice.detach(),
+            'metric_defect_pixel_precision': true_positive / predicted_positive.clamp_min(1.0),
+            'metric_defect_pixel_recall': true_positive / target_positive.clamp_min(1.0),
+        })
         return {'loss_defect': self.defect_bce_weight * bce + self.defect_dice_weight * dice}
 
-    def loss_hard_bg(self, outputs, targets, indices, num_boxes):
-        zero = outputs['pred_logits'].sum() * 0.0
-        if not self.use_hard_bg or self.current_epoch < self.hard_bg_start_epoch:
-            self._diagnostics['metric_hard_bg_selected_per_image'] = zero
-            return {'loss_hard_bg': zero}
-        selected, counts = select_hard_background_queries(
-            outputs['pred_logits'], outputs.get('pred_quality'), outputs['pred_boxes'], targets, indices,
-            self.hard_bg_topk, self.hard_bg_iou_threshold,
+    def loss_query_semantic(self, outputs, targets, indices, num_boxes):
+        semantic_quality = outputs.get('pred_sem_quality')
+        if semantic_quality is None:
+            return {'loss_query_semantic': outputs['pred_logits'].sum() * 0.0}
+        semantic_quality = semantic_quality.squeeze(-1).float().clamp(1e-6, 1.0 - 1e-6)
+        best_iou = self._best_iou_target(outputs, targets)
+        semantic_target, _, positive_mask, far_background_mask = build_query_semantic_supervision(
+            best_iou, indices, self.semantic_query_bg_iou_threshold
         )
-        loss = F.binary_cross_entropy_with_logits(
-            outputs['pred_logits'][selected], torch.zeros_like(outputs['pred_logits'][selected])
-        ) if selected.any() else zero
-        self._diagnostics['metric_hard_bg_selected_per_image'] = counts.mean()
-        return {'loss_hard_bg': loss}
+        # q_sem is a pooled probability rather than a single logit, so use the
+        # explicit stable BCE expression (torch BCE on probabilities rejects AMP).
+        semantic_target = semantic_target.float()
+        bce = -(
+            semantic_target * semantic_quality.log()
+            + (1.0 - semantic_target) * (1.0 - semantic_quality).log()
+        )
+        zero = semantic_quality.sum() * 0.0
+        positive_loss = self._masked_mean(bce, positive_mask, zero)
+        background_loss = self._masked_mean(bce, far_background_mask, zero)
+        loss = (
+            self.semantic_query_pos_weight * positive_loss
+            + self.semantic_query_bg_weight * background_loss
+        )
+        positive_mean = self._masked_mean(semantic_quality, positive_mask, zero)
+        background_mean = self._masked_mean(semantic_quality, far_background_mask, zero)
+        self._diagnostics.update({
+            'metric_semq_pred_pos': positive_mean,
+            'metric_semq_pred_far_bg': background_mean,
+            'metric_semq_pos_bg_gap': positive_mean - background_mean,
+        })
+        return {'loss_query_semantic': loss}
+
+    def loss_final_bg_rank(self, outputs, targets, indices, num_boxes):
+        zero = outputs['pred_logits'].sum() * 0.0
+        if not self.use_final_bg_rank or self.current_epoch < self.final_bg_start_epoch:
+            self._diagnostics.update({
+                'metric_final_bg_selected_per_image': zero,
+                'metric_final_bg_score_mean': zero,
+                'metric_matched_final_score_mean': zero,
+                'metric_rank_violation_ratio': zero,
+            })
+            return {'loss_final_bg_rank': zero}
+
+        final_scores = compose_dual_quality_scores(
+            outputs['pred_logits'].sigmoid(),
+            pred_loc_quality=outputs.get('pred_loc_quality'),
+            pred_sem_quality=outputs.get('pred_sem_quality'),
+            loc_quality_power=self.loc_quality_power,
+            semantic_quality_power=self.semantic_quality_power,
+        )
+        best_iou = self._best_iou_target(outputs, targets)
+        selected, counts = select_final_score_background(
+            final_scores,
+            best_iou,
+            indices,
+            topk=self.final_bg_topk,
+            iou_threshold=self.final_bg_iou_threshold,
+        )
+        loss = final_score_ranking_loss(
+            final_scores,
+            targets,
+            indices,
+            selected,
+            margin=self.final_bg_margin,
+            temperature=self.final_bg_temperature,
+        )
+
+        background_values = final_scores[selected].amax(-1) if selected.any() else final_scores.new_zeros((0,))
+        positive_parts = []
+        for batch_index, (source_indices, target_indices) in enumerate(indices):
+            if source_indices.numel():
+                labels = targets[batch_index]['labels'][target_indices]
+                positive_parts.append(final_scores[batch_index, source_indices, labels])
+        positive_values = torch.cat(positive_parts) if positive_parts else final_scores.new_zeros((0,))
+        violation_parts = []
+        for batch_index, (source_indices, target_indices) in enumerate(indices):
+            image_background = final_scores[batch_index, selected[batch_index]].amax(-1)
+            if not source_indices.numel() or not image_background.numel():
+                continue
+            labels = targets[batch_index]['labels'][target_indices]
+            image_positive = final_scores[batch_index, source_indices, labels]
+            k = min(image_positive.numel(), image_background.numel())
+            violation_parts.append(
+                (image_background.topk(k).values + self.final_bg_margin
+                 > image_positive.topk(k, largest=False).values).float()
+            )
+        violation = torch.cat(violation_parts).mean() if violation_parts else zero
+        self._diagnostics.update({
+            'metric_final_bg_selected_per_image': counts.mean() if counts.numel() else zero,
+            'metric_final_bg_score_mean': background_values.mean() if background_values.numel() else zero,
+            'metric_matched_final_score_mean': positive_values.mean() if positive_values.numel() else zero,
+            'metric_rank_violation_ratio': violation,
+        })
+        return {'loss_final_bg_rank': loss}
 
     def loss_labels_focal(self, outputs, targets, indices, num_boxes):
         assert 'pred_logits' in outputs
@@ -432,7 +489,7 @@ class DEIMCriterion(nn.Module):
         self.fgl_targets, self.fgl_targets_dn = None, None
         self.own_targets, self.own_targets_dn = None, None
         self.num_pos, self.num_neg = None, None
-        self._sq_cache = {}
+        self._alignment_cache = {}
         self._diagnostics = {}
 
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
@@ -441,10 +498,10 @@ class DEIMCriterion(nn.Module):
             'focal': self.loss_labels_focal,
             'vfl': self.loss_labels_vfl,
             'mal': self.loss_labels_mal,
-            'sqmal': self.loss_labels_sqmal,
-            'quality': self.loss_quality,
+            'loc_quality': self.loss_loc_quality,
             'defect': self.loss_defect,
-            'hard_bg': self.loss_hard_bg,
+            'query_semantic': self.loss_query_semantic,
+            'final_bg_rank': self.loss_final_bg_rank,
             'local': self.loss_local,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
@@ -485,7 +542,8 @@ class DEIMCriterion(nn.Module):
                 torch.distributed.all_reduce(num_boxes_go)
             num_boxes_go = torch.clamp(num_boxes_go / get_world_size(), min=1).item()
         else:
-            assert 'aux_outputs' in outputs, ''
+            indices_go = indices
+            num_boxes_go = None
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_boxes = sum(len(t["labels"]) for t in targets)
@@ -493,6 +551,8 @@ class DEIMCriterion(nn.Module):
         if is_dist_available_and_initialized():
             torch.distributed.all_reduce(num_boxes)
         num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
+        if num_boxes_go is None:
+            num_boxes_go = num_boxes
 
         # Compute all the requested losses, main loss
         losses = {}

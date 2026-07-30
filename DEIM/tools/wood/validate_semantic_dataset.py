@@ -1,4 +1,4 @@
-"""校验 SQ-MAL COCO 的 RLE、mask_valid 及 bbox/category/id 不变性。"""
+"""校验 semantic COCO 的 RLE、mask_valid 及 bbox/category/id 不变性。"""
 
 from __future__ import annotations
 
@@ -7,16 +7,16 @@ import json
 from collections import Counter
 from pathlib import Path
 
-from sqmal_data_utils import decode_segmentation
+from semantic_mask_data_utils import decode_segmentation
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sqmal-coco", type=Path, required=True)
+    parser.add_argument("--semantic-coco", type=Path, required=True)
     parser.add_argument("--original-coco", type=Path)
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
-    data = json.loads(args.sqmal_coco.read_text(encoding="utf-8"))
+    data = json.loads(args.semantic_coco.read_text(encoding="utf-8"))
     images = {int(image["id"]): image for image in data.get("images", [])}
     errors = []
     valid = 0
@@ -72,4 +72,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -1,4 +1,4 @@
-"""抽样可视化 COCO bbox 与 SQ-MAL RLE mask。"""
+"""抽样可视化 COCO bbox 与 semantic RLE mask。"""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
 
-from sqmal_data_utils import decode_segmentation
+from semantic_mask_data_utils import decode_segmentation
 
 
 def main() -> None:
@@ -50,4 +50,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

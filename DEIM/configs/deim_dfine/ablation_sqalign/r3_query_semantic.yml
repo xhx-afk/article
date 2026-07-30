@@ -1,0 +1,73 @@
+# =============================================================================
+# R3：R2 + Query Semantic Evidence / Alignment
+# =============================================================================
+# 将 R2 的 defectness map 真正接入 query 决策：每个 predicted box 在 defect map
+# 上做 ROIAlign，再对 ROI 中最高响应的一部分像素求均值，得到 pred_sem_quality。
+# 推理时 class、loc quality、semantic quality 在 top-k 之前共同组成最终分数。
+__include__: ["./r2_loc_defect_aux.yml"]
+
+# 默认输出目录；通常由训练命令覆盖。
+output_dir: ./output/sqalign/r3_query_semantic
+
+DEIM:
+  # true：在训练和推理前向中执行 box ROI semantic pooling，输出：
+  #   pred_sem_quality [B,Q,1]，已经是 [0,1] 概率，不是 logit。
+  # 该开关依赖从 R2 继承的 use_defectness_head=true。
+  use_query_semantic: true
+  # ROIAlign 输出的正方形空间尺寸。7 表示每个 query 得到 7×7=49 个采样值。
+  semantic_roi_size: 7
+  # 从 49 个 sigmoid ROI 响应中选择最高 ceil(49×0.20)=10 个像素求均值。
+  # 这种 top-k mean 比全框平均更适合 Crack/resin 等细长、稀疏缺陷。
+  semantic_topk_ratio: 0.20
+  # true：ROI 坐标由 pred_boxes.detach() 构造。semantic loss 的梯度进入 defectness
+  # head/encoder，但不通过 ROI 坐标改变 bbox 回归分支。
+  semantic_detach_boxes: true
+  # false：推理结果只保留 query 级 pred_sem_quality，不返回完整 heatmap。
+  # defectness head 在推理时仍会执行，因为 semantic score 依赖它。
+  return_defect_map_in_eval: false
+
+DEIMCriterion:
+  # query_semantic 只作用于 main query；不会复制到 decoder aux、pre、encoder 或 DN。
+  losses: ["mal", "boxes", "local", "loc_quality", "defect", "query_semantic"]
+  # Hungarian matched query 的 semantic target=1，该组 BCE 的内部权重。
+  semantic_query_pos_weight: 1.0
+  # unmatched far-background query 的 semantic target=0，该组 BCE 的内部权重。
+  # 使用 0.25 防止数量巨大的背景 ROI 压倒正 query。
+  semantic_query_bg_weight: 0.25
+  # unmatched query 的 best-IoU <0.10 才作为 semantic background；
+  # best-IoU >=0.10 的 near-GT unmatched query 会被 ignore，不会错误压制潜在正候选。
+  semantic_query_bg_iou_threshold: 0.10
+  weight_dict:
+    # loss_query_semantic 在总 loss 中的外层系数。
+    loss_query_semantic: 0.25
+
+PostProcessor:
+  # true：把 pred_sem_quality 作为最终分数因子，并在 flatten/top-k 前融合。
+  semantic_quality_rerank: true
+  # semantic quality 指数 δ。最终 focal 分支分数为：
+  #   sigmoid(class_logit)
+  #   * sigmoid(pred_loc_quality)^0.25
+  #   * clamp(pred_sem_quality, 1e-6, 1)^0.25
+  # 该概率不会再做一次 sigmoid。
+  semantic_quality_power: 0.25
+
+# --------------------------- 重点观察 ---------------------------
+# loss_query_semantic、metric_semq_pred_pos、metric_semq_pred_far_bg、
+# metric_semq_pos_bg_gap。健康趋势为 pos > far-bg；同时检查可视化中细长缺陷的
+# ROI evidence 是否保留，避免 defect map 背景大面积高响应。
+
+# --------------------------- 推荐训练命令 ---------------------------
+#   conda activate yolov11
+#   mkdir -p output_2/sqalign_v2/r3_query_semantic
+#   CUDA_VISIBLE_DEVICES=0,2 torchrun --master_port=7833 --nproc_per_node=2 \
+#     train.py -c configs/deim_dfine/ablation_sqalign/r3_query_semantic.yml \
+#     --use-amp --seed=0 \
+#     -t ./weight/deim_dfine_hgnetv2_l_coco_50e.pth \
+#     --output-dir output_2/sqalign_v2/r3_query_semantic \
+#     2>&1 | tee output_2/sqalign_v2/r3_query_semantic/train_console.log
+#
+# 训练后可视化（不会训练模型）：
+#   python tools/wood/visualize_defectness_and_query_scores.py \
+#     -c configs/deim_dfine/ablation_sqalign/r3_query_semantic.yml \
+#     -r output_2/sqalign_v2/r3_query_semantic/best_stg2.pth \
+#     --output-dir output_2/sqalign_v2/r3_query_semantic/visuals

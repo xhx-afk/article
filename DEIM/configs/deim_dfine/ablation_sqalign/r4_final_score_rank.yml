@@ -1,0 +1,61 @@
+# =============================================================================
+# R4：R3 + Final-Score-Aligned Background Ranking
+# =============================================================================
+# 只从 unmatched 且 best-IoU<0.10 的远背景 query 中挖掘困难样本，候选排序直接
+# 使用与推理一致的最终分数：class × loc^η × semantic^δ。每图最强背景与最弱
+# matched positive 配对，使用 softplus ranking loss，而不是旧式全类别全 0 BCE。
+__include__: ["./r3_query_semantic.yml"]
+
+# 默认输出目录；通常由训练命令覆盖。
+output_dir: ./output/sqalign/r4_final_score_rank
+
+DEIMCriterion:
+  # 在 R3 全部损失上增加 final_bg_rank；主分类仍然是 mal。
+  losses: ["mal", "boxes", "local", "loc_quality", "defect", "query_semantic", "final_bg_rank"]
+  # true：达到 start epoch 后启用背景候选选择和 pairwise ranking loss。
+  use_final_bg_rank: true
+  # 每张图最多选择最终分数最高的 5 个有效远背景 query。
+  # 候选不足 5 时使用实际数量；top-k index 的选择使用 detached final score。
+  final_bg_topk: 5
+  # 只有与全部 GT 的最大 IoU <0.10 且未 matched 的 query 才能成为背景候选。
+  final_bg_iou_threshold: 0.10
+  # current_epoch <10 时 loss 返回可求导 0；从 current_epoch>=10 开始启用，
+  # 避免训练初期分类、loc 和 semantic 分数尚未稳定时错误挖掘背景。
+  final_bg_start_epoch: 10
+  # 希望正样本最终分数至少比背景高 0.05。ranking 形式：
+  #   softplus((S_bg - S_pos + margin) / temperature)
+  final_bg_margin: 0.05
+  # ranking softplus 的温度；越小越强调违反 margin 的 pair，也可能使梯度更尖锐。
+  final_bg_temperature: 0.10
+  # criterion 内构造 final score 时使用的 loc 指数 η。必须与继承的
+  # PostProcessor.loc_quality_power 保持一致，才能做到训练选择与推理排序对齐。
+  loc_quality_power: 0.25
+  # criterion 内构造 final score 时使用的 semantic 指数 δ。必须与继承的
+  # PostProcessor.semantic_quality_power 保持一致。
+  semantic_quality_power: 0.25
+  weight_dict:
+    # loss_final_bg_rank 在总 loss 中的外层系数。首轮设为 0.05，降低 Recall 风险。
+    loss_final_bg_rank: 0.05
+
+# --------------------------- 重点观察 ---------------------------
+# loss_final_bg_rank、metric_final_bg_selected_per_image、
+# metric_final_bg_score_mean、metric_matched_final_score_mean、
+# metric_rank_violation_ratio。健康趋势为 matched score > bg score，violation 下降。
+# 若真实 R4 不优于 R3，应降低 topk/weight/margin 或直接以 R3 作为最终方案。
+
+# --------------------------- 推荐训练命令 ---------------------------
+#   conda activate yolov11
+#   mkdir -p output_2/sqalign_v2/r4_final_score_rank
+#   CUDA_VISIBLE_DEVICES=0,2 torchrun --master_port=7834 --nproc_per_node=2 \
+#     train.py -c configs/deim_dfine/ablation_sqalign/r4_final_score_rank.yml \
+#     --use-amp --seed=0 \
+#     -t ./weight/deim_dfine_hgnetv2_l_coco_50e.pth \
+#     --output-dir output_2/sqalign_v2/r4_final_score_rank \
+#     2>&1 | tee output_2/sqalign_v2/r4_final_score_rank/train_console.log
+#
+# 单卡、最多 100 iteration 的合成 smoke（脚本硬限制 <=100，不会完整训练）：
+#   CUDA_VISIBLE_DEVICES=0 python tools/wood/smoke_test_sqalign.py \
+#     -c configs/deim_dfine/ablation_sqalign/r4_final_score_rank.yml \
+#     -t ./weight/deim_dfine_hgnetv2_l_coco_50e.pth \
+#     --iterations 100 --batch-size 2 --image-size 128 --num-classes 9 --amp \
+#     --output-json output_2/sqalign_v2/r4_final_score_rank/smoke_100.json

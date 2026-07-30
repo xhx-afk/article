@@ -1,4 +1,4 @@
-"""将类别级 semantic maps 转换为逐实例 COCO RLE，供 SQ-MAL 训练。"""
+"""将类别级 semantic maps 转换为逐实例 COCO RLE，供 SQ-Align 训练。"""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from PIL import Image, ImageDraw
 
-from sqmal_data_utils import (
+from semantic_mask_data_utils import (
     EXPECTED_CLASSES,
     SemanticSpec,
     bbox_iou_xyxy,
@@ -253,7 +253,7 @@ def convert(args: argparse.Namespace) -> Dict[str, object]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Augment COCO annotations with SQ-MAL semantic RLE masks")
+    parser = argparse.ArgumentParser(description="Augment COCO annotations with semantic RLE masks")
     parser.add_argument("--images-dir", type=Path, required=True)
     parser.add_argument("--semantic-maps-dir", type=Path, required=True)
     parser.add_argument("--semantic-spec", type=Path)
@@ -280,4 +280,3 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     result = convert(parse_args())
     print(json.dumps(result, ensure_ascii=False, indent=2))
-

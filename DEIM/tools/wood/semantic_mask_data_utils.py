@@ -1,6 +1,8 @@
-"""SQ-MAL semantic-map 数据工具的共享函数。"""
+"""Semantic-map 数据工具的共享函数。"""
 
 from __future__ import annotations
+
+# Shared semantic-mask data utilities used by SQ-Align.
 
 import json
 import re
@@ -193,4 +195,3 @@ def bbox_iou_xyxy(a: Sequence[float], b: Sequence[float]) -> float:
     area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
     union = area_a + area_b - inter
     return inter / union if union > 0 else 0.0
-

@@ -16,4 +16,4 @@ from .rtdetrv2_decoder import RTDETRTransformerv2
 
 from .postprocessor import PostProcessor
 from .deim_criterion import DEIMCriterion
-from .sqmal import DefectnessHead, QueryQualityHead
+from .semantic_query_alignment import DefectnessHead, QueryLocalizationQualityHead

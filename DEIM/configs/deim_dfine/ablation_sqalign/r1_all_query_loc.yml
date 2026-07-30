@@ -1,0 +1,68 @@
+# =============================================================================
+# R1：R0 + All-Query Localization Quality
+# =============================================================================
+# 每个 decoder query 学习它与当前图像任意 GT 的最大 IoU：
+#   target_loc[b,q] = max_j IoU(pred_box[b,q].detach(), gt_box[b,j])
+# 因而 near-GT unmatched/duplicate query 也能获得连续的非零定位质量目标；
+# 不再把所有 unmatched query 统一当作 target=0。
+#
+# 继承 R0 的原 MAL 与 semantic-mask 数据链；主分类目标没有被质量目标替换。
+__include__: ["./r0_baseline.yml"]
+
+# 默认输出目录；通常由训练命令的 --output-dir 覆盖。
+output_dir: ./output/sqalign/r1_all_query_loc
+
+DFINETransformer:
+  # true：在每一层 decoder 结构中构建 localization-quality MLP，最终主输出增加：
+  #   pred_loc_quality [B,Q,1]，其值为 logit，使用 sigmoid 后才是质量概率。
+  use_loc_quality_head: true
+  # quality MLP 的中间层宽度。128 是首轮消融默认值；增大可提高容量但会增加参数量。
+  loc_quality_hidden_dim: 128
+  # 0：只把最终 decoder 层的 pred_loc_quality 交给 criterion，不给 aux_outputs
+  # 复制质量监督。该设置满足“新 loss 只作用于 main 分支”的首版约束。
+  loc_quality_aux_last_n: 0
+
+DEIMCriterion:
+  # mal：原 DEIM Matching-Aware Loss，仍是唯一主分类 loss；
+  # boxes：L1 + GIoU；local：FGL/DDF；loc_quality：新增 all-query BCE。
+  losses: ["mal", "boxes", "local", "loc_quality"]
+  # best-IoU >= 0.10 视为 near-GT query；低于阈值视为 far background。
+  loc_near_iou_threshold: 0.10
+  # near query BCE 的组级权重。组内先独立求均值，因此不会被 far query 数量稀释。
+  loc_near_weight: 1.0
+  # far background BCE 的组级权重。降低到 0.10，避免大量背景 query 主导质量 head。
+  loc_far_weight: 0.10
+  # Hungarian matched query 的额外 BCE 权重；它会在 near/far 基础项之外再强化一次。
+  loc_matched_extra_weight: 1.0
+  weight_dict:
+    # loss_loc_quality 在总训练 loss 中的外层系数；与上面三个组内权重相互独立。
+    loss_loc_quality: 0.5
+
+PostProcessor:
+  # true：推理时使用 localization quality 调整分类分数。
+  # 融合发生在 class 维度 flatten 和 top-k 之前，因此会真实改变保留的 query。
+  loc_quality_rerank: true
+  # 最终分数中的定位质量指数 η：
+  #   score = class_probability * sigmoid(pred_loc_quality)^0.25
+  # 0 表示该分支对分数恒等；数值过大可能降低 Recall/AP50。
+  loc_quality_power: 0.25
+
+# --------------------------- 重点观察 ---------------------------
+# loss_loc_quality、metric_locq_pred_near、metric_locq_pred_far、
+# metric_locq_best_iou_spearman_batch。健康趋势应为 near > far，Spearman 逐步提高。
+
+# --------------------------- 推荐训练命令 ---------------------------
+#   conda activate yolov11
+#   mkdir -p output_2/sqalign_v2/r1_all_query_loc
+#   CUDA_VISIBLE_DEVICES=0,2 torchrun --master_port=7831 --nproc_per_node=2 \
+#     train.py -c configs/deim_dfine/ablation_sqalign/r1_all_query_loc.yml \
+#     --use-amp --seed=0 \
+#     -t ./weight/deim_dfine_hgnetv2_l_coco_50e.pth \
+#     --output-dir output_2/sqalign_v2/r1_all_query_loc \
+#     2>&1 | tee output_2/sqalign_v2/r1_all_query_loc/train_console.log
+#
+# 单卡 100 iteration 前的结构/梯度 smoke（不会完整训练）：
+#   CUDA_VISIBLE_DEVICES=0 python tools/wood/smoke_test_sqalign.py \
+#     -c configs/deim_dfine/ablation_sqalign/r1_all_query_loc.yml \
+#     -t ./weight/deim_dfine_hgnetv2_l_coco_50e.pth \
+#     --iterations 100 --batch-size 2 --image-size 128 --num-classes 9 --amp
