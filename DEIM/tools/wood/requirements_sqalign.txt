@@ -1,0 +1,8 @@
+# Optional semantic-mask preparation and SQ-Align evaluation dependencies.
+numpy
+Pillow
+pycocotools
+scipy
+matplotlib
+# 可选：安装 tidecv 后评估脚本会额外生成 TIDE 误差分解。
+# tidecv
