@@ -1,0 +1,63 @@
+{
+  "config": "configs\\deim_dfine\\ablation_sqalign_v3\\v4_near_gt_candidate_rank.yml",
+  "checkpoint_load": {
+    "matched": 1156,
+    "missing": 42
+  },
+  "iterations": 10,
+  "batch_size": 2,
+  "image_size": 128,
+  "device": "cuda:0",
+  "amp": true,
+  "amp_init_scale": 1.0,
+  "elapsed_seconds": 5.99825969999074,
+  "mean_seconds_per_iteration": 0.599825969999074,
+  "output_shapes": {
+    "pred_logits": [
+      2,
+      300,
+      9
+    ],
+    "pred_boxes": [
+      2,
+      300,
+      4
+    ],
+    "pred_query_features": [
+      2,
+      300,
+      256
+    ],
+    "pred_defect_logits": [
+      2,
+      1,
+      16,
+      16
+    ],
+    "pred_query_mask_logits": [
+      2,
+      300,
+      7,
+      7
+    ],
+    "pred_sem_quality": [
+      2,
+      300,
+      1
+    ]
+  },
+  "last_iteration": {
+    "iteration": 10,
+    "total_loss": 95.03150939941406,
+    "loss_mal": 1.67905855178833,
+    "loss_bbox": 1.641908884048462,
+    "loss_giou": 1.1146732568740845,
+    "loss_fgl": 1.659003734588623,
+    "loss_defect": 0.6131829023361206,
+    "loss_query_mask": 0.38732585310935974,
+    "loss_semantic_quality": 0.27535244822502136,
+    "loss_semantic_rank": 0.004402810242027044,
+    "loss_candidate_rank": 0.09314136952161789
+  },
+  "all_finite": true
+}

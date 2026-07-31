@@ -150,10 +150,12 @@ class BatchImageCollateFunction(BaseCollateFunction):
             updated_targets = deepcopy(targets)
 
             for i in range(len(targets)):
-                # Combine boxes, labels, and areas from original and shifted targets
-                updated_targets[i]['boxes'] = torch.cat([targets[i]['boxes'], shifted_targets[i]['boxes']], dim=0)
-                updated_targets[i]['labels'] = torch.cat([targets[i]['labels'], shifted_targets[i]['labels']], dim=0)
-                updated_targets[i]['area'] = torch.cat([targets[i]['area'], shifted_targets[i]['area']], dim=0)
+                # 所有逐实例字段必须与 boxes 使用相同拼接顺序。
+                for key in ('boxes', 'labels', 'area', 'iscrowd', 'masks', 'mask_valid'):
+                    if key in targets[i] and key in shifted_targets[i]:
+                        updated_targets[i][key] = torch.cat(
+                            [targets[i][key], shifted_targets[i][key]], dim=0
+                        )
 
                 # Add mixup ratio to targets
                 updated_targets[i]['mixup'] = torch.tensor(
@@ -193,7 +195,9 @@ class BatchImageCollateFunction(BaseCollateFunction):
             images = F.interpolate(images, size=sz)
             if 'masks' in targets[0]:
                 for tg in targets:
-                    tg['masks'] = F.interpolate(tg['masks'], size=sz, mode='nearest')
-                raise NotImplementedError('')
+                    masks = tg['masks']
+                    tg['masks'] = F.interpolate(
+                        masks[:, None].float(), size=(sz, sz), mode='nearest'
+                    )[:, 0] > 0.5
 
         return images, targets

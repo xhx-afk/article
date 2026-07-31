@@ -1,0 +1,48 @@
+# =============================================================================
+# SQ-Align V3 / V2：V1 + Query-Conditioned Semantic Evidence（QCSE）
+# =============================================================================
+# 每个 decoder query 与其预测框 ROI 内的 encoder pixel embedding 独立交互，
+# 生成 [B,Q,7,7] mask；不再让所有 query 共享同一张 union defect map ROI。
+
+# 继承 V1，因此 BDA 仍启用；本文件只增加 query-conditioned mask 分支。
+__include__: ["./v1_defect_aux.yml"]
+
+# V2 默认输出目录；可被命令行 --output-dir 覆盖。
+output_dir: ./output_2/sqalign_v3/v2_query_conditioned_mask
+
+DEIM:
+  # 启用 SemanticPixelProjection、QuerySemanticProjection、ROIAlign 和 query mask。
+  enable_query_conditioned_mask: true
+  # pixel/query 共同 embedding 维度 D；mask dot-product 会除以 sqrt(D)。
+  semantic_embed_dim: 64
+  # true：pixel projection 中 depthwise 3×3 使用 stride=2，使最高分辨率
+  # encoder feature 再下采样一次，默认约为输入 stride 16，以控制显存。
+  semantic_pixel_downsample: true
+  # decoder 最终 query feature 的通道数；当前 DFINE hidden_dim=256。
+  semantic_query_dim: 256
+  # 每个预测框 ROIAlign 后的空间尺寸，输出 mask 为 7×7。
+  semantic_roi_size: 7
+  # true：ROIAlign 前 detach 预测框，防止 mask loss 反向扰动 bbox 回归。
+  semantic_detach_boxes: true
+
+DEIMCriterion:
+  # 在 V1 上增加 query-mask BCE+Dice；新 loss 仍只作用于 main branch。
+  losses: ["mal", "boxes", "local", "defect", "query_mask"]
+  # best IoU < 0.10 定义为 far-background，target 为全零 mask；matched query
+  # 即使 IoU 较低也优先使用 Hungarian 指定的 GT。
+  semantic_background_iou_threshold: 0.10
+  # 每图除全部 matched 外，最多采样的 near-GT unmatched query 数。
+  # near query 按 class score × best IoU 选择，采样 index 全部 detach。
+  query_mask_max_near: 20
+  # 每图最多采样的 far-background query 数，按最高 class score 选择。
+  query_mask_max_far: 20
+  # matched query 组内 mask loss 权重。
+  query_mask_matched_weight: 1.0
+  # near-unmatched query 组内 mask loss 权重，降低未匹配候选的影响。
+  query_mask_near_weight: 0.25
+  # far-background 全零 target 的组内权重，避免背景数量压过正样本。
+  query_mask_far_weight: 0.10
+  weight_dict:
+    # 组合后的 query-mask BCE+Dice 加到总 loss 时的外部权重。
+    loss_query_mask: 0.25
+

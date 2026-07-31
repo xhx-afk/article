@@ -1,0 +1,34 @@
+# =============================================================================
+# SQ-Align V3 / V1：V0 + Binary Defect Auxiliary（BDA）
+# =============================================================================
+# BDA 只提供训练期二值缺陷像素辅助监督，不参与分类分数融合。
+
+# 继承 V0 的模型、数据、优化器和基础 loss；本文件只写相对 V0 的增量字段。
+# YAML 加载器会递归合并子字典，因此下面的 weight_dict 不会清除基础 loss 权重。
+__include__: ["./v0_baseline.yml"]
+
+# V1 默认输出目录；可被命令行 --output-dir 覆盖。
+output_dir: ./output_2/sqalign_v3/v1_defect_aux
+
+DEIM:
+  # 创建 DefectnessHead，并从最高分辨率 encoder feature 预测 union defect map。
+  enable_defect_auxiliary: true
+  # 输入到 defect head 的 encoder 通道数；当前 HybridEncoder 输出为 256。
+  semantic_in_channels: 256
+  # defect head 中间通道数：1×1 Conv → depthwise 3×3 → GN/SiLU → 1×1。
+  defect_hidden_channels: 128
+  # 常规 eval 时不返回大尺寸 defect map，以避免额外输出/显存；统一 evaluator
+  # 会在运行时将它改为 true，从而计算 low/original-resolution 指标。
+  return_alignment_maps_in_eval: false
+
+DEIMCriterion:
+  # 在 V0 的 MAL/bbox/local 上增加 defect BCE+Dice；只作用于 main branch。
+  losses: ["mal", "boxes", "local", "defect"]
+  # defect BCEWithLogits 在 loss_defect 内部的相对系数。
+  defect_bce_weight: 1.0
+  # soft Dice loss 在 loss_defect 内部的相对系数。
+  defect_dice_weight: 1.0
+  weight_dict:
+    # 完整 defect loss 加到总训练 loss 时的外部权重。
+    loss_defect: 0.5
+

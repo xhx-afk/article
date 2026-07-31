@@ -3,6 +3,8 @@ Copied from RT-DETR (https://github.com/lyuwenyu/RT-DETR)
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
+import inspect
+
 import torch
 import torch.nn as nn
 
@@ -17,7 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from .._misc import convert_to_tv_tensor, _boxes_keys
 from .._misc import Image, Video, Mask, BoundingBoxes
-from .._misc import SanitizeBoundingBoxes
+from .._misc import SanitizeBoundingBoxes as TorchvisionSanitizeBoundingBoxes
 
 from ...core import register
 torchvision.disable_beta_transforms_warning()
@@ -30,9 +32,87 @@ Resize = register()(T.Resize)
 # ToImageTensor = register()(T.ToImageTensor)
 # ConvertDtype = register()(T.ConvertDtype)
 # PILToTensor = register()(T.PILToTensor)
-SanitizeBoundingBoxes = register(name='SanitizeBoundingBoxes')(SanitizeBoundingBoxes)
 RandomCrop = register()(T.RandomCrop)
 Normalize = register()(T.Normalize)
+
+
+_SANITIZE_INDEX_KEY = "_sanitize_instance_index"
+_INSTANCE_FIELD_KEYS = ("labels", "area", "iscrowd", "mask_valid", "mixup")
+
+
+def _get_target(inputs: Any):
+    target = None
+    if isinstance(inputs, dict):
+        target = inputs
+    elif isinstance(inputs, (tuple, list)) and len(inputs) > 1 and isinstance(inputs[1], dict):
+        target = inputs[1]
+    return target
+
+
+def _replace_target(inputs: Any, target: Dict[str, Any]):
+    if isinstance(inputs, dict):
+        return target
+    values = list(inputs)
+    values[1] = target
+    return tuple(values) if isinstance(inputs, tuple) else values
+
+
+def _get_sanitize_index(inputs: Any):
+    """旧版 torchvision 只接受单个 labels Tensor，因此使用临时实例索引。"""
+    target = _get_target(inputs)
+    return None if target is None else target.get(_SANITIZE_INDEX_KEY)
+
+
+@register(name="SanitizeBoundingBoxes")
+class SanitizeBoundingBoxes(TorchvisionSanitizeBoundingBoxes):
+    """同步清理 boxes、masks 以及所有逐实例元数据。"""
+
+    def __init__(self, min_size: float = 1.0, min_area: float = 1.0, labels_getter=None) -> None:
+        self._sync_instance_fields = labels_getter is None
+        kwargs = {
+            "min_size": min_size,
+            "labels_getter": _get_sanitize_index if self._sync_instance_fields else labels_getter,
+        }
+        try:
+            supports_min_area = "min_area" in inspect.signature(
+                TorchvisionSanitizeBoundingBoxes.__init__
+            ).parameters
+        except (TypeError, ValueError):
+            supports_min_area = False
+        if supports_min_area:
+            kwargs["min_area"] = min_area
+        elif min_area != 1.0:
+            raise TypeError(
+                "当前 torchvision 的 SanitizeBoundingBoxes 不支持 min_area；"
+                "请使用默认 min_area=1.0 或升级 torchvision。"
+            )
+        super().__init__(**kwargs)
+
+    def forward(self, *inputs: Any) -> Any:
+        if not self._sync_instance_fields:
+            return super().forward(*inputs)
+
+        packed_inputs = inputs if len(inputs) > 1 else inputs[0]
+        target = _get_target(packed_inputs)
+        if target is None or not isinstance(target.get("boxes"), torch.Tensor):
+            return super().forward(*inputs)
+
+        instance_count = int(target["boxes"].shape[0])
+        working_target = dict(target)
+        working_target[_SANITIZE_INDEX_KEY] = torch.arange(
+            instance_count, device=target["boxes"].device
+        )
+        outputs = super().forward(_replace_target(packed_inputs, working_target))
+        output_target = _get_target(outputs)
+        if output_target is None:
+            return outputs
+
+        keep_indices = output_target.pop(_SANITIZE_INDEX_KEY)
+        for key in _INSTANCE_FIELD_KEYS:
+            value = output_target.get(key)
+            if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == instance_count:
+                output_target[key] = value[keep_indices]
+        return outputs
 
 
 @register()

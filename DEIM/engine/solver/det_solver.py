@@ -85,6 +85,7 @@ class DetSolver(BaseSolver):
                 self.device, 
                 epoch, 
                 max_norm=args.clip_max_norm, 
+                total_epochs=args.epoches,
                 print_freq=args.print_freq, 
                 ema=self.ema, 
                 scaler=self.scaler, 

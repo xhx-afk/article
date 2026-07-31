@@ -1,0 +1,53 @@
+# =============================================================================
+# SQ-Align V3 / V0：原始 DEIM-D-FINE 基线
+# =============================================================================
+# 目的：只训练原 DEIM MAL 分类与 D-FINE 框回归/分布定位损失，不启用任何
+# BDA、query mask、semantic quality、semantic gate 或 candidate ranking。
+# V1～V4 都逐级继承本文件，因此数据、输入尺寸、优化器、epoch 和增强保持一致。
+
+# 继承 Wood 数据集上的 DEIM-HGNetv2-L 完整基础配置，其中定义：
+# - num_classes=9、960×960 输入、25 epoch；
+# - train/val 数据路径、数据增强与 batch size；
+# - HGNetv2-B4 backbone、HybridEncoder、DFINETransformer；
+# - AdamW、FlatCosine 调度、EMA、基础 MAL/bbox/FGL/DDF loss 权重。
+__include__: ["../deim_hgnetv2_l_wood.yml"]
+
+# 默认实验输出目录。命令行 --output-dir 的优先级更高，可在启动时覆盖。
+output_dir: ./output_2/sqalign_v3/v0_baseline
+
+# 即使 V0 不使用 mask loss，也让所有消融读取完全相同的数据字段，避免 V0～V4
+# 因数据路径或标注解析差异而不可比较。return_masks=true 会额外返回：
+# target["masks"]      : [N,H,W] instance mask；
+# target["mask_valid"]: [N]，标记对应 mask 是否有效。
+train_dataloader:
+  dataset:
+    return_masks: true
+
+# 验证集也返回 mask，统一 evaluator 才能同时计算 defect/query-mask 诊断；
+# 对 V0 而言这些分支会在 JSON 中明确报告 unavailable，而不会伪造数值。
+val_dataloader:
+  dataset:
+    return_masks: true
+
+# DEIM 顶层模型的 V3 功能开关。V0 全部关闭，因此不会创建新分支参数，
+# 推理输出只有原检测结果和 decoder 的正常主输出。
+DEIM:
+  # 是否启用 Binary Defect Auxiliary。false 表示无 pred_defect_logits。
+  enable_defect_auxiliary: false
+  # 是否启用 query-conditioned 7×7 ROI mask。它依赖 defect stage；V0 关闭。
+  enable_query_conditioned_mask: false
+  # 是否启用 learned semantic quality head。它依赖 query mask；V0 关闭。
+  enable_semantic_quality: false
+
+# Criterion 主损失列表：
+# - mal   : 原 DEIM Matching-Aware Loss 主分类；
+# - boxes : L1 bbox + GIoU；
+# - local : D-FINE FGL，并在满足条件时产生 DDF。
+# V3 新 loss 不会自动复制到 decoder aux、encoder aux、pre 或 DN 分支。
+DEIMCriterion:
+  losses: ["mal", "boxes", "local"]
+
+# 后处理阶段关闭 semantic gate，最终 top-k 与原 DEIM 完全一致。
+PostProcessor:
+  semantic_gate_enabled: false
+

@@ -1,0 +1,51 @@
+# =============================================================================
+# SQ-Align V3 / V4：V3 + Near-GT Candidate Ranking（NGCR）
+# =============================================================================
+# 围绕每个 GT 对近邻候选做定位排序和 anchor 类别排序，直接处理 duplicate、
+# localization 和 class-confusion FP；不再构造“弱 matched 对最强远背景”pair。
+
+# 继承 V3 的 BDA、query mask、continuous semantic quality 和 semantic rank。
+__include__: ["./v3_continuous_semantic_quality.yml"]
+
+# V4 默认输出目录；可被命令行 --output-dir 覆盖。
+output_dir: ./output_2/sqalign_v3/v4_near_gt_candidate_rank
+
+DEIMCriterion:
+  # 在 V3 主分支损失上增加 per-GT candidate rank。
+  losses:
+    ["mal", "boxes", "local", "defect", "query_mask", "semantic_quality", "semantic_rank", "candidate_rank"]
+  # 总开关。若为 false，即使 losses 包含 candidate_rank 也返回可导的零 loss。
+  enable_candidate_rank: true
+  # query 与某个 GT 的 IoU 至少达到 0.30 才进入该 GT 的候选组。
+  candidate_iou_threshold: 0.30
+  # 两候选真实 IoU 至少相差 0.10 才要求高 IoU 候选分数更高。
+  candidate_iou_gap: 0.10
+  # true-class final rank score 的目标最小间隔。
+  candidate_rank_margin: 0.03
+  # 每个 GT 最多选取 3 个最困难的定位排序 pair 计算 loss。
+  candidate_rank_topk_per_gt: 3
+  # 每个 GT 先按 true-class score 最多保留 10 个 query 候选；选择过程 detach。
+  candidate_max_per_gt: 10
+  # anchor 的 true-class score 应比 hardest wrong-class score 至少高 0.05。
+  class_rank_margin: 0.05
+  # localization/class softplus ranking loss 的温度。
+  candidate_rank_temperature: 0.10
+  # 前 60% epoch 不启用 candidate rank，避免早期框和类别尚未稳定时错误排序。
+  candidate_rank_start_ratio: 0.60
+  # 训练 rank_score 可使用 class_probability × semantic_gate.detach()；
+  # lambda=0.10 表示 semantic gate 最多抑制 10%，且不把梯度传回 semantic 分支。
+  candidate_semantic_gate_lambda: 0.10
+  # candidate rank 内部 gate 的曲线指数。
+  candidate_semantic_gate_gamma: 2.0
+  weight_dict:
+    # candidate localization+class rank 加入总 loss 的外部权重。
+    loss_candidate_rank: 0.05
+
+PostProcessor:
+  # 默认仍关闭推理 gate；训练后必须在 validation sweep 决定是否开启。
+  semantic_gate_enabled: false
+  # V4 建议的初始 sweep/候选排序参考值；不是已验证的最终 test 参数。
+  semantic_gate_lambda: 0.10
+  # suppression-only gate 指数；gate 始终位于 [1-lambda, 1]。
+  semantic_gate_gamma: 2.0
+

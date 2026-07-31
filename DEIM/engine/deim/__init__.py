@@ -16,3 +16,9 @@ from .rtdetrv2_decoder import RTDETRTransformerv2
 
 from .postprocessor import PostProcessor
 from .deim_criterion import DEIMCriterion
+from .continuous_semantic_alignment import (
+    DefectnessHead,
+    QuerySemanticProjection,
+    SemanticPixelProjection,
+    SemanticQualityHead,
+)

@@ -92,8 +92,17 @@ class CocoDetection(torchvision.datasets.CocoDetection, DetDataset):
 
 def convert_coco_poly_to_mask(segmentations, height, width):
     masks = []
-    for polygons in segmentations:
-        rles = coco_mask.frPyObjects(polygons, height, width)
+    for segmentation in segmentations:
+        if not segmentation:
+            masks.append(torch.zeros((height, width), dtype=torch.uint8))
+            continue
+        if isinstance(segmentation, dict):
+            # COCO 支持 uncompressed RLE(counts=list) 和 compressed RLE(counts=str/bytes)。
+            rles = coco_mask.frPyObjects(segmentation, height, width) \
+                if isinstance(segmentation.get('counts'), list) else segmentation
+        else:
+            # polygon list
+            rles = coco_mask.frPyObjects(segmentation, height, width)
         mask = coco_mask.decode(rles)
         if len(mask.shape) < 3:
             mask = mask[..., None]
@@ -136,8 +145,13 @@ class ConvertCocoPolysToMask(object):
 
         labels = torch.tensor(labels, dtype=torch.int64)
 
+        mask_valid = torch.tensor(
+            [bool(obj.get("mask_valid", bool(obj.get("segmentation")))) for obj in anno],
+            dtype=torch.bool,
+        )
+
         if self.return_masks:
-            segmentations = [obj["segmentation"] for obj in anno]
+            segmentations = [obj.get("segmentation", []) for obj in anno]
             masks = convert_coco_poly_to_mask(segmentations, h, w)
 
         keypoints = None
@@ -151,6 +165,7 @@ class ConvertCocoPolysToMask(object):
         keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
         boxes = boxes[keep]
         labels = labels[keep]
+        mask_valid = mask_valid[keep]
         if self.return_masks:
             masks = masks[keep]
         if keypoints is not None:
@@ -159,6 +174,7 @@ class ConvertCocoPolysToMask(object):
         target = {}
         target["boxes"] = boxes
         target["labels"] = labels
+        target["mask_valid"] = mask_valid
         if self.return_masks:
             target["masks"] = masks
         target["image_id"] = image_id

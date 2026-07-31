@@ -1,0 +1,55 @@
+# =============================================================================
+# SQ-Align V3 / V3：V2 + Continuous Mask-Supported Quality（CMSQ）
+# =============================================================================
+# SemanticQualityHead 学习连续 mask-support target，不再使用 raw top-20% mean，
+# 也不把 matched target 固定为 1。训练配置默认关闭推理 gate，训练完成后只在
+# validation 集 sweep lambda/gamma，再把选定参数固定用于 test。
+
+# 继承 V2 的 BDA、query-conditioned ROI mask 和全部基础检测损失。
+__include__: ["./v2_query_conditioned_mask.yml"]
+
+# V3 默认输出目录；可被命令行 --output-dir 覆盖。
+output_dir: ./output_2/sqalign_v3/v3_continuous_semantic_quality
+
+DEIM:
+  # 启用 learned SemanticQualityHead，输出 pred_sem_quality [B,Q,1] logits。
+  enable_semantic_quality: true
+  # 将最终 decoder query feature 从 256 维投影到 32 维，再与 10 个 mask
+  # 统计量拼接；该字段是 quality head 内部 query projection 的维度。
+  semantic_quality_query_dim: 32
+  # semantic quality MLP 的隐藏层宽度。
+  semantic_quality_hidden_dim: 128
+
+DEIMCriterion:
+  # 增加 soft-label semantic-quality BCE 与 quality 内部 pairwise ranking。
+  # continuous target 只监督此处，绝不乘进原 DEIM MAL 正样本 target。
+  losses:
+    ["mal", "boxes", "local", "defect", "query_mask", "semantic_quality", "semantic_rank"]
+  # Hungarian matched query 的 semantic-quality BCE 组内权重。
+  semantic_matched_weight: 1.0
+  # near-GT unmatched query 的 semantic-quality BCE 组内权重。
+  semantic_near_weight: 0.5
+  # far-background（target=0）的 semantic-quality BCE 组内权重。
+  semantic_far_weight: 0.10
+  # 每图只在最高分类分数的最多 30 个有效 query 中构造 semantic rank pair。
+  semantic_rank_topk: 30
+  # 只有 target_sem_i > target_sem_j + 0.15 才构造有序 pair。
+  semantic_rank_target_gap: 0.15
+  # 预测 semantic probability 希望保持的最小排序间隔。
+  semantic_rank_margin: 0.03
+  # softplus pairwise rank loss 的温度；越小越强调违反 margin 的 pair。
+  semantic_rank_temperature: 0.10
+  weight_dict:
+    # semantic soft-label BCE 加入总 loss 的外部权重。
+    loss_semantic_quality: 0.25
+    # semantic 内部排序辅助加入总 loss 的外部权重。
+    loss_semantic_rank: 0.05
+
+PostProcessor:
+  # 训练/常规验证默认关闭 gate，先得到未融合的真实基线结果。
+  semantic_gate_enabled: false
+  # gate 下界为 1-lambda；lambda=0.20 时最多把分类分数抑制到 80%。
+  semantic_gate_lambda: 0.20
+  # g=1-lambda*(1-q)^gamma；gamma 控制抑制曲线形状，不会让 g>1。
+  semantic_gate_gamma: 2.0
+

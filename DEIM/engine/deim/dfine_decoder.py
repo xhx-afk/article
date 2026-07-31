@@ -262,8 +262,12 @@ class Integral(nn.Module):
 
     def forward(self, x, project):
         shape = x.shape
-        x = F.softmax(x.reshape(-1, self.reg_max + 1), dim=1)
-        x = F.linear(x, project.to(x.device)).reshape(-1, 4)
+        # Distribution integration is a numerically sensitive reduction.  In
+        # AMP, doing SoftmaxBackward in fp16 can produce NaN gradients even
+        # while the forward values remain finite.  Preserve the original
+        # D-FINE formulation but evaluate its probability kernel in fp32.
+        x = F.softmax(x.reshape(-1, self.reg_max + 1).float(), dim=1)
+        x = F.linear(x, project.to(device=x.device, dtype=torch.float32)).reshape(-1, 4)
         return x.reshape(list(shape[:-1]) + [-1])
 
 
@@ -278,7 +282,9 @@ class LQE(nn.Module):
 
     def forward(self, scores, pred_corners):
         B, L, _ = pred_corners.size()
-        prob = F.softmax(pred_corners.reshape(B, L, 4, self.reg_max+1), dim=-1)
+        prob = F.softmax(
+            pred_corners.reshape(B, L, 4, self.reg_max + 1).float(), dim=-1
+        )
         prob_topk, _ = prob.topk(self.k, dim=-1)
         stat = torch.cat([prob_topk, prob_topk.mean(dim=-1, keepdim=True)], dim=-1)
         quality_score = self.reg_conf(stat.reshape(B, L, -1))
@@ -385,7 +391,6 @@ class TransformerDecoder(nn.Module):
                 dec_out_bboxes.append(inter_ref_bbox)
                 dec_out_pred_corners.append(pred_corners)
                 dec_out_refs.append(ref_points_initial)
-
                 if not self.training:
                     break
 
@@ -394,7 +399,7 @@ class TransformerDecoder(nn.Module):
             output_detach = output.detach()
 
         return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), \
-               torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), pre_bboxes, pre_scores
+               torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), pre_bboxes, pre_scores, output
 
 
 @register()
@@ -506,7 +511,6 @@ class DFINETransformer(nn.Module):
             [MLP(hidden_dim, hidden_dim, 4 * (self.reg_max+1), 3, act=mlp_act) for _ in range(self.eval_idx + 1)]
           + [MLP(scaled_dim, scaled_dim, 4 * (self.reg_max+1), 3, act=mlp_act) for _ in range(num_layers - self.eval_idx - 1)])
         self.integral = Integral(self.reg_max)
-
         # init encoder output anchors and valid_mask
         if self.eval_spatial_size:
             anchors, valid_mask = self._generate_anchors()
@@ -724,7 +728,7 @@ class DFINETransformer(nn.Module):
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
         # decoder
-        out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits = self.decoder(
+        out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits, query_features = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
             memory,
@@ -749,6 +753,7 @@ class DFINETransformer(nn.Module):
 
             dn_out_corners, out_corners = torch.split(out_corners, dn_meta['dn_num_split'], dim=2)
             dn_out_refs, out_refs = torch.split(out_refs, dn_meta['dn_num_split'], dim=2)
+            _, query_features = torch.split(query_features, dn_meta['dn_num_split'], dim=1)
 
 
         if self.training:
@@ -756,6 +761,7 @@ class DFINETransformer(nn.Module):
                    'ref_points': out_refs[-1], 'up': self.up, 'reg_scale': self.reg_scale}
         else:
             out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
+        out['pred_query_features'] = query_features
 
         if self.training and self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss2(out_logits[:-1], out_bboxes[:-1], out_corners[:-1], out_refs[:-1],

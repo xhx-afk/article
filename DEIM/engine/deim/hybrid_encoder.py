@@ -13,7 +13,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .tsem import TextureScaleEnhancementModule
 from .utils import get_activation
 
 from ..core import register
@@ -301,15 +300,6 @@ class HybridEncoder(nn.Module):
                  act='silu',
                  eval_spatial_size=None,
                  version='dfine',
-                 use_tsem=False,
-                 tsem_mode='off',
-                 tsem_levels=(0, 1, 2),
-                 tsem_smooth_kernel=5,
-                 tsem_dilations=(1, 2, 3),
-                 tsem_reduction=16,
-                 tsem_init_scale=0.0,
-                 tsem_learnable_smoothing=True,
-                 tsem_debug=False,
                  ):
         super().__init__()
         self.in_channels = in_channels
@@ -331,21 +321,6 @@ class HybridEncoder(nn.Module):
                 ]))
 
             self.input_proj.append(proj)
-
-        self.use_tsem = bool(use_tsem and tsem_mode != 'off')
-        if self.use_tsem:
-            self.tsem = TextureScaleEnhancementModule(
-                channels=hidden_dim,
-                num_levels=len(in_channels),
-                mode=tsem_mode,
-                levels=tuple(tsem_levels),
-                smooth_kernel=tsem_smooth_kernel,
-                dilations=tuple(tsem_dilations),
-                reduction=tsem_reduction,
-                init_scale=tsem_init_scale,
-                learnable_smoothing=tsem_learnable_smoothing,
-                debug=tsem_debug,
-            )
 
         # encoder transformer
         encoder_layer = TransformerEncoderLayer(
@@ -420,8 +395,6 @@ class HybridEncoder(nn.Module):
     def forward(self, feats):
         assert len(feats) == len(self.in_channels)
         proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
-        if self.use_tsem:
-            proj_feats = self.tsem(proj_feats)
 
         # encoder
         if self.num_encoder_layers > 0:

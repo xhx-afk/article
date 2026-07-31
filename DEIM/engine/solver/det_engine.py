@@ -26,6 +26,9 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                     device: torch.device, epoch: int, max_norm: float = 0, **kwargs):
     model.train()
     criterion.train()
+    criterion_module = criterion.module if hasattr(criterion, 'module') else criterion
+    if hasattr(criterion_module, 'set_epoch'):
+        criterion_module.set_epoch(epoch, kwargs.get('total_epochs'))
     metric_logger = MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
@@ -64,7 +67,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
             with torch.autocast(device_type=str(device), enabled=False):
                 loss_dict = criterion(outputs, targets, **metas)
 
-            loss = sum(loss_dict.values())
+            loss = sum(value for key, value in loss_dict.items() if key.startswith('loss_'))
             scaler.scale(loss).backward()
 
             if max_norm > 0:
@@ -79,7 +82,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
             outputs = model(samples, targets=targets)
             loss_dict = criterion(outputs, targets, **metas)
 
-            loss : torch.Tensor = sum(loss_dict.values())
+            loss : torch.Tensor = sum(value for key, value in loss_dict.items() if key.startswith('loss_'))
             optimizer.zero_grad()
             loss.backward()
 
@@ -99,7 +102,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                 lr_warmup_scheduler.step()
 
         loss_dict_reduced = dist_utils.reduce_dict(loss_dict)
-        loss_value = sum(loss_dict_reduced.values())
+        loss_value = sum(value for key, value in loss_dict_reduced.items() if key.startswith('loss_'))
 
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value))
